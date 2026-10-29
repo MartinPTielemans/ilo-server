@@ -85,13 +85,32 @@ pub async fn authenticate(db: &Db, access_token: &str) -> anyhow::Result<Option<
 
 /// Swaps a refresh token for new tokens; the old refresh token stops working.
 pub async fn refresh(db: &Db, refresh_token: &str) -> anyhow::Result<Option<(Device, Tokens)>> {
-    let Some(device) = find(db, refresh_token, REFRESH).await? else {
+    // Deleting it first makes it renew once, even when two requests race, so a
+    // copy of it can't keep a second set of tokens alive beside the device's.
+    let device_id: Option<String> = sqlx::query_scalar(
+        "DELETE FROM tokens WHERE token_hash = $1 AND kind = $2 AND expires_at > $3 \
+         RETURNING device_id",
+    )
+    .bind(db::hash(refresh_token))
+    .bind(REFRESH)
+    .bind(db::now())
+    .fetch_optional(db)
+    .await?;
+    let Some(device_id) = device_id else {
         return Ok(None);
     };
-    sqlx::query("DELETE FROM tokens WHERE token_hash = $1")
-        .bind(db::hash(refresh_token))
-        .execute(db)
-        .await?;
+    let account_id: Option<String> =
+        sqlx::query_scalar("SELECT account_id FROM devices WHERE id = $1")
+            .bind(&device_id)
+            .fetch_optional(db)
+            .await?;
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    let device = Device {
+        id: device_id,
+        account_id,
+    };
     sqlx::query("UPDATE devices SET last_seen_at = $1 WHERE id = $2")
         .bind(db::now())
         .bind(&device.id)
