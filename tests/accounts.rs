@@ -229,6 +229,33 @@ async fn an_address_gets_five_codes_an_hour_however_many_sign_ins_ask() {
 }
 
 #[tokio::test]
+async fn sign_ins_asking_at_once_still_get_five_codes_an_hour() {
+    let server = start().await;
+    let email = unique_email("burst");
+    let mut browsers = Vec::new();
+    for _ in 0..20 {
+        let browser = browser();
+        browser
+            .get(server.authorize_url(&pkce(), "s"))
+            .send()
+            .await
+            .unwrap();
+        browsers.push(browser);
+    }
+    let asks = browsers.iter().map(|browser| {
+        browser
+            .post(format!("{}/authorize/email", server.url))
+            .form(&[("email", &email)])
+            .send()
+    });
+    for response in futures_util::future::join_all(asks).await {
+        assert_eq!(response.unwrap().status(), 200);
+    }
+    let sent = server.mail.lock().unwrap().len();
+    assert!(sent <= 5, "{sent} codes were mailed to one address");
+}
+
+#[tokio::test]
 async fn the_code_flow_needs_pkce_and_a_known_redirect() {
     let server = start().await;
     let unknown = server

@@ -189,7 +189,7 @@ async fn start(
         .bind(now)
         .execute(db)
         .await?;
-    sqlx::query("DELETE FROM code_mailings WHERE sent_at < $1")
+    sqlx::query("DELETE FROM code_mailings WHERE hour_started_at < $1")
         .bind(now - HOUR)
         .execute(db)
         .await?;
@@ -318,13 +318,7 @@ async fn send_code(
         let note = again.then_some("We sent a code a moment ago. It can take a minute to arrive.");
         return code_page(state, sign_in, email, note, None).await;
     }
-    let mailed: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM code_mailings WHERE email = $1 AND sent_at > $2")
-            .bind(email)
-            .bind(now - HOUR)
-            .fetch_one(&state.db)
-            .await?;
-    if mailed >= CODES_PER_ADDRESS_PER_HOUR {
+    if !take_mailing(state, email, now).await? {
         return Ok(pages::email(
             Some(email),
             Some("We've sent this address too many codes. Try again in an hour."),
@@ -338,6 +332,7 @@ async fn send_code(
     .fetch_optional(&state.db)
     .await?;
     let Some(sent) = sent else {
+        give_back_mailing(state, email).await?;
         return code_page(
             state,
             sign_in,
@@ -372,18 +367,45 @@ async fn send_code(
             .bind(sign_in)
             .execute(&state.db)
             .await?;
+        give_back_mailing(state, email).await?;
         return Ok(pages::email(
             Some(email),
             Some("The server couldn't send mail. Try again in a moment."),
         ));
     }
-    sqlx::query("INSERT INTO code_mailings (email, sent_at) VALUES ($1, $2)")
-        .bind(email)
-        .bind(now)
-        .execute(&state.db)
-        .await?;
     let note = (sent > 1).then_some("We sent a new code.");
     code_page(state, sign_in, email, note, None).await
+}
+
+/// Takes one of the address's codes for the hour, if it has one left. One
+/// statement locks the address's row, so sign-ins asking at once can't all
+/// read a count under the limit before any of them adds to it.
+async fn take_mailing(state: &Shared, email: &str, now: i64) -> anyhow::Result<bool> {
+    let taken: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO code_mailings (email, hour_started_at, sent) VALUES ($1, $2, 1) \
+         ON CONFLICT (email) DO UPDATE SET \
+         sent = CASE WHEN code_mailings.hour_started_at <= $3 THEN 1 ELSE code_mailings.sent + 1 END, \
+         hour_started_at = CASE WHEN code_mailings.hour_started_at <= $3 THEN $2 \
+         ELSE code_mailings.hour_started_at END \
+         WHERE code_mailings.hour_started_at <= $3 OR code_mailings.sent < $4 \
+         RETURNING sent",
+    )
+    .bind(email)
+    .bind(now)
+    .bind(now - HOUR)
+    .bind(CODES_PER_ADDRESS_PER_HOUR)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(taken.is_some())
+}
+
+/// Returns a code taken for a mail that was never sent.
+async fn give_back_mailing(state: &Shared, email: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE code_mailings SET sent = sent - 1 WHERE email = $1 AND sent > 0")
+        .bind(email)
+        .execute(&state.db)
+        .await?;
+    Ok(())
 }
 
 /// The code page, saying when the code expires and whether a new one can be sent.
