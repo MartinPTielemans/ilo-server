@@ -5,8 +5,10 @@
 //! 1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775: the same ids, permanent folders,
 //! progress tokens and keystore keys. No code is copied from it.
 //!
-//! Specifics stay bytes. The server reads only their top-level field number,
-//! which names the data type even when the rest is encrypted.
+//! Specifics stay bytes. The server reads only their top-level field
+//! numbers, which name the data type even when the rest is encrypted and say
+//! whether it is, and for passwords, which Chromium encrypts inside their own
+//! field, the field numbers one level down.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -32,7 +34,40 @@ use crate::tokens::{Authenticated, Device};
 /// Field numbers in EntitySpecifics, which the protocol uses as data type ids.
 pub const BOOKMARKS: i32 = 32904;
 pub const NIGORI: i32 = 47745;
-const ENCRYPTED: u64 = 1;
+const PASSWORDS: i32 = 45873;
+const PASSWORDS_FIELD: u32 = PASSWORDS as u32;
+const ENCRYPTED: u32 = 1;
+/// The types Chromium never encrypts, `EncryptionPolicy::kNeverEncrypted` in
+/// components/sync/base/data_type.cc at the pin. Every other type reaches the
+/// server encrypted from a client with a custom passphrase, which ilo always
+/// sets, so a type Chromium adds later is refused unencrypted until it's here.
+const NEVER_ENCRYPTED: [i32; 26] = [
+    NIGORI, 150251,  // HISTORY_DELETE_DIRECTIVES
+    154522,  // DEVICE_INFO
+    163425,  // PRIORITY_PREFERENCES
+    186662,  // SUPERVISED_USER_SETTINGS
+    306270,  // AUTOFILL_WALLET_DATA
+    455206,  // USER_EVENTS
+    556014,  // USER_CONSENTS
+    600372,  // SECURITY_EVENTS
+    703915,  // OS_PRIORITY_PREFERENCES
+    728866,  // SHARING_MESSAGE
+    963985,  // HISTORY
+    1033580, // AUTOFILL_WALLET_USAGE
+    1034378, // CONTACT_INFO
+    1141935, // INCOMING_PASSWORD_SHARING_INVITATION
+    1142081, // OUTGOING_PASSWORD_SHARING_INVITATION, sealed to the recipient
+    1239418, // SHARED_TAB_GROUP_DATA
+    1259076, // COLLABORATION_GROUP
+    1419865, // AUTOFILL_VALUABLE
+    1438954, // ACCOUNT_SETTING
+    1484017, // SHARED_COMMENT
+    1520954, // AUTOFILL_VALUABLE_METADATA
+    1564245, // SKILL
+    1661069, // ENCRYPTED_TAB_CONTEXT_ITEM
+    1670131, // JOURNEY
+    1670544, // NOTEBOOK
+];
 const MAX_BATCH: usize = 500;
 const ROOT_PARENT: &str = "0";
 const BOOKMARK_FOLDERS: [(&str, &str); 3] = [
@@ -339,29 +374,66 @@ pub fn empty_specifics(data_type: i32) -> Vec<u8> {
     bytes
 }
 
-/// The data type of serialized specifics: their first field other than `encrypted`.
-pub fn data_type_of(mut specifics: &[u8]) -> Option<i32> {
+/// The fields of a serialized message, each with its bytes when it has any.
+fn fields(mut message: &[u8]) -> Option<Vec<(u32, &[u8])>> {
     use prost::encoding::{WireType, decode_key, decode_varint};
-    while !specifics.is_empty() {
-        let (field, wire_type) = decode_key(&mut specifics).ok()?;
-        if u64::from(field) != ENCRYPTED {
-            return i32::try_from(field).ok();
-        }
-        let skip = match wire_type {
+    let mut fields = Vec::new();
+    while !message.is_empty() {
+        let (field, wire_type) = decode_key(&mut message).ok()?;
+        let length = match wire_type {
             WireType::Varint => {
-                decode_varint(&mut specifics).ok()?;
+                decode_varint(&mut message).ok()?;
                 0
             }
             WireType::SixtyFourBit => 8,
             WireType::ThirtyTwoBit => 4,
-            WireType::LengthDelimited => {
-                usize::try_from(decode_varint(&mut specifics).ok()?).ok()?
-            }
+            WireType::LengthDelimited => usize::try_from(decode_varint(&mut message).ok()?).ok()?,
             WireType::StartGroup | WireType::EndGroup => return None,
         };
-        specifics = specifics.get(skip..)?;
+        fields.push((field, message.get(..length)?));
+        message = &message[length..];
     }
-    None
+    Some(fields)
+}
+
+/// The data type of serialized specifics: their first field other than `encrypted`.
+pub fn data_type_of(specifics: &[u8]) -> Option<i32> {
+    let (field, _) = fields(specifics)?
+        .into_iter()
+        .find(|(field, _)| *field != ENCRYPTED)?;
+    i32::try_from(field).ok()
+}
+
+/// Whether specifics are as Chromium commits them under a custom passphrase.
+/// It replaces them with `encrypted` and the data type's field, empty
+/// (`DataTypeWorker::EncryptSpecifics`). Passwords instead hold only their
+/// own `encrypted` and `encrypted_notes_backup` (fields 1 and 5), without
+/// the plaintext `client_only_encrypted_data` or `unencrypted_metadata`
+/// (`EncryptPasswordSpecificsData`).
+fn is_encrypted(data_type: i32, specifics: &[u8]) -> bool {
+    let has_ciphertext = |fields: &[(u32, &[u8])]| {
+        fields
+            .iter()
+            .any(|(field, bytes)| *field == ENCRYPTED && !bytes.is_empty())
+    };
+    let Some(top) = fields(specifics) else {
+        return false;
+    };
+    if data_type == PASSWORDS {
+        let [(PASSWORDS_FIELD, password)] = top.as_slice() else {
+            return false;
+        };
+        return fields(password).is_some_and(|password| {
+            has_ciphertext(&password)
+                && password
+                    .iter()
+                    .all(|(field, _)| [ENCRYPTED, 5].contains(field))
+        });
+    }
+    has_ciphertext(&top)
+        && top.iter().all(|(field, bytes)| {
+            *field == ENCRYPTED || (i32::try_from(*field) == Ok(data_type) && bytes.is_empty())
+        })
 }
 
 fn data_type_of_id(id: &str) -> Option<i32> {
@@ -569,6 +641,23 @@ async fn commit_entry(
         // clearing the server data instead.
         return Ok((refused(InvalidMessage, "Nigori can't be deleted"), None));
     }
+    // A plaintext item can only come from a client without ilo's passphrase,
+    // or one that committed before setting it; keeping it would keep data
+    // the server must never be able to read. Chromium names every item it
+    // encrypts "encrypted", or nothing, so any other name is readable too.
+    let unnamed = |name: Option<&str>| matches!(name, None | Some("" | "encrypted"));
+    if !entry.deleted()
+        && !NEVER_ENCRYPTED.contains(&data_type)
+        && !(is_encrypted(data_type, entry.specifics())
+            && unnamed(entry.name.as_deref())
+            && unnamed(entry.non_unique_name.as_deref()))
+    {
+        tracing::warn!(data_type, "refused an item that isn't encrypted");
+        return Ok((
+            refused(InvalidMessage, "this data type is kept only encrypted"),
+            None,
+        ));
+    }
     if entry.deleted() && version == 0 {
         return Ok((
             refused(InvalidMessage, "the server never had this entity"),
@@ -763,6 +852,39 @@ mod tests {
         assert_eq!(data_type_of(&encrypted), Some(37702));
         assert_eq!(data_type_of(&[0x0a, 3, 1, 2, 3]), None);
         assert_eq!(data_type_of(&[0x0a, 9, 1]), None);
+    }
+
+    #[test]
+    fn specifics_are_encrypted_as_chromium_encrypts_them() {
+        let mut bookmark = vec![0x0a, 3, 1, 2, 3];
+        bookmark.extend(empty_specifics(BOOKMARKS));
+        assert!(is_encrypted(BOOKMARKS, &bookmark));
+        assert!(!is_encrypted(BOOKMARKS, &empty_specifics(BOOKMARKS)));
+        // A title beside the ciphertext is plaintext all the same.
+        let mut leaky = vec![0x0a, 3, 1, 2, 3];
+        leaky.extend([0xc2, 0x88, 0x10, 2, 0x12, 0]);
+        assert_eq!(data_type_of(&leaky), Some(BOOKMARKS));
+        assert!(!is_encrypted(BOOKMARKS, &leaky));
+        assert!(!is_encrypted(BOOKMARKS, &[0x0a, 0]));
+
+        let password = |inner: &[u8]| {
+            let mut bytes = Vec::new();
+            prost::encoding::bytes::encode(PASSWORDS as u32, &inner.to_vec(), &mut bytes);
+            bytes
+        };
+        // `encrypted`, then `encrypted_notes_backup`.
+        assert!(is_encrypted(
+            PASSWORDS,
+            &password(&[0x0a, 1, 9, 0x2a, 1, 9])
+        ));
+        // `unencrypted_metadata` holds the site.
+        assert!(!is_encrypted(
+            PASSWORDS,
+            &password(&[0x0a, 1, 9, 0x1a, 1, 9])
+        ));
+        // `client_only_encrypted_data` is the password itself.
+        assert!(!is_encrypted(PASSWORDS, &password(&[0x12, 1, 9])));
+        assert!(!is_encrypted(PASSWORDS, &empty_specifics(PASSWORDS)));
     }
 
     #[test]

@@ -19,6 +19,8 @@ ilo turns on a custom passphrase before it first syncs, so Chromium encrypts eac
 - **The relay:** which of an account's devices message each other, when, and how large the messages are. Not what they say. Adding a device also shows the name and operating system it gives, and keys and a sealed passphrase that the server can't open.
 - **The network:** like any web server, the addresses requests come from and when. This server doesn't log them, but a proxy in front of it may.
 
+The server refuses an item that arrives unencrypted, for every type Chromium encrypts under a passphrase, so a client that hasn't set one, an unmodified Chromium included, can't sync those types here.
+
 Sign-in codes and tokens are stored only as hashes.
 
 ## Self-hosting
