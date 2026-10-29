@@ -8,7 +8,7 @@ Binary values in JSON are base64url without padding. Times are Unix seconds.
 
 The server is an OpenID Connect provider (`/.well-known/openid-configuration`). ilo is a public client, `client_id=ilo`, using the authorization code flow with PKCE (`S256` only). It may redirect to a loopback address (RFC 8252), to the server's own `/signed-in` page, or to an address in the server's `OIDC_REDIRECT_URIS`.
 
-ilo opens `/authorize` in a tab. The user enters their email and then the 6-digit code mailed to it. A code works for 10 minutes and for 5 tries, and a sign-in may ask for one new code. An account with a passkey is offered it before a code. After an account's first sign-in, the pages offer a passkey once. Each way ends on `/authorize/done`, which sends the tab on after a second to the redirect URI with `code`, `state` and `iss`.
+ilo opens `/authorize` in a tab. The user enters their email and then the 6-digit code mailed to it. A code works for 10 minutes and for 5 tries, a sign-in may ask for one new code, and an address gets at most 5 codes an hour, however many sign-ins ask. An account with a passkey is offered it before a code. After an account's first sign-in, the pages offer a passkey once. Each way ends on `/authorize/done`, which sends the tab on after a second to the redirect URI with `code`, `state` and `iss`.
 
 `POST /token` exchanges the code (`grant_type=authorization_code`, `code_verifier`, and `device_name`, which the device list shows). Each exchange makes a **device** and gives it:
 

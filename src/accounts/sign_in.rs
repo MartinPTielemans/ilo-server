@@ -29,6 +29,10 @@ const CODE_RESEND_AFTER: i64 = 30;
 const CODE_ATTEMPTS: i64 = 5;
 /// The first code and one new one.
 const CODES_PER_SIGN_IN: i64 = 2;
+/// Codes an address gets in an hour, across every sign-in that asks: five tries
+/// each, so guessing one of a million codes takes years, not hours.
+const CODES_PER_ADDRESS_PER_HOUR: i64 = 5;
+const HOUR: i64 = 60 * 60;
 pub const AUTHORIZATION_CODE_LIFETIME: i64 = 60;
 
 #[derive(Deserialize)]
@@ -185,6 +189,10 @@ async fn start(
         .bind(now)
         .execute(db)
         .await?;
+    sqlx::query("DELETE FROM code_mailings WHERE sent_at < $1")
+        .bind(now - HOUR)
+        .execute(db)
+        .await?;
     let id = db::random_id();
     sqlx::query(
         "INSERT INTO sign_ins (id, client_id, redirect_uri, state, nonce, code_challenge, scope, created_at) \
@@ -310,6 +318,18 @@ async fn send_code(
         let note = again.then_some("We sent a code a moment ago. It can take a minute to arrive.");
         return code_page(state, sign_in, email, note, None).await;
     }
+    let mailed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM code_mailings WHERE email = $1 AND sent_at > $2")
+            .bind(email)
+            .bind(now - HOUR)
+            .fetch_one(&state.db)
+            .await?;
+    if mailed >= CODES_PER_ADDRESS_PER_HOUR {
+        return Ok(pages::email(
+            Some(email),
+            Some("We've sent this address too many codes. Try again in an hour."),
+        ));
+    }
     let sent: Option<i64> = sqlx::query_scalar(
         "UPDATE sign_ins SET codes_sent = codes_sent + 1 WHERE id = $1 AND codes_sent < $2 RETURNING codes_sent",
     )
@@ -357,6 +377,11 @@ async fn send_code(
             Some("The server couldn't send mail. Try again in a moment."),
         ));
     }
+    sqlx::query("INSERT INTO code_mailings (email, sent_at) VALUES ($1, $2)")
+        .bind(email)
+        .bind(now)
+        .execute(&state.db)
+        .await?;
     let note = (sent > 1).then_some("We sent a new code.");
     code_page(state, sign_in, email, note, None).await
 }
@@ -412,43 +437,48 @@ pub async fn code(
     };
     let can_resend = sign_in.codes_sent < CODES_PER_SIGN_IN;
     let result: anyhow::Result<Response> = async {
-        let row: Option<(String, i64, i64)> = sqlx::query_as(
-            "SELECT code_hash, expires_at, attempts FROM sign_in_codes WHERE email = $1",
+        let now = db::now();
+        // Counting the try in the same statement that reads the code, so tries
+        // sent at once can't all be checked before any is counted.
+        let code_hash: Option<String> = sqlx::query_scalar(
+            "UPDATE sign_in_codes SET attempts = attempts + 1 \
+             WHERE email = $1 AND expires_at > $2 AND attempts < $3 RETURNING code_hash",
         )
         .bind(&email)
+        .bind(now)
+        .bind(CODE_ATTEMPTS)
         .fetch_optional(&state.db)
         .await?;
         let refused = |error| code_page(&state, &sign_in.id, &email, None, Some(error));
-        let Some((code_hash, _, attempts)) =
-            row.filter(|(_, expires_at, _)| *expires_at > db::now())
-        else {
-            return refused(if can_resend {
-                "That code has expired. Send a new one."
-            } else {
-                "That code has expired. Start again from ilo."
+        let Some(code_hash) = code_hash else {
+            let live: Option<i64> = sqlx::query_scalar(
+                "SELECT attempts FROM sign_in_codes WHERE email = $1 AND expires_at > $2",
+            )
+            .bind(&email)
+            .bind(now)
+            .fetch_optional(&state.db)
+            .await?;
+            return refused(match (live.is_some(), can_resend) {
+                (true, true) => "Too many tries. Send a new code.",
+                (true, false) => "Too many tries. Start again from ilo.",
+                (false, true) => "That code has expired. Send a new one.",
+                (false, false) => "That code has expired. Start again from ilo.",
             })
             .await;
         };
-        if attempts >= CODE_ATTEMPTS {
-            return refused(if can_resend {
-                "Too many tries. Send a new code."
-            } else {
-                "Too many tries. Start again from ilo."
-            })
-            .await;
-        }
         let typed: String = form.code.chars().filter(|c| !c.is_whitespace()).collect();
         if db::hash(&typed) != code_hash {
-            sqlx::query("UPDATE sign_in_codes SET attempts = attempts + 1 WHERE email = $1")
-                .bind(&email)
-                .execute(&state.db)
-                .await?;
             return refused("That code isn't right.").await;
         }
-        sqlx::query("DELETE FROM sign_in_codes WHERE email = $1")
+        // Only one of two tries with the right code signs in.
+        let used = sqlx::query("DELETE FROM sign_in_codes WHERE email = $1 AND code_hash = $2")
             .bind(&email)
+            .bind(&code_hash)
             .execute(&state.db)
             .await?;
+        if used.rows_affected() == 0 {
+            return refused("That code has already been used. Start again from ilo.").await;
+        }
         let account = super::find_or_create(&state.db, &email).await?;
         sqlx::query("UPDATE sign_ins SET account_id = $1 WHERE id = $2")
             .bind(&account)
