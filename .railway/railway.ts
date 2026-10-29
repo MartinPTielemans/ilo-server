@@ -1,6 +1,6 @@
 // Unverified: written from Railway's Infrastructure as Code docs, never applied.
-// Railway builds the Dockerfile without this file; it adds what the image
-// can't carry: Postgres, the health check, and one replica for the relay.
+// Railway builds the Dockerfile without this file, and reads the health check
+// and the one replica the relay needs from ../railway.json; this adds Postgres.
 import { defineRailway, github, postgres, project, service } from "railway/iac";
 
 export default defineRailway(() => {
