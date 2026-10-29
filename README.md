@@ -28,7 +28,7 @@ You need a domain with HTTPS in front of the server, which passkeys require, and
 **With Docker Compose** (the server and Postgres):
 
 1. `git clone https://github.com/MartinPTielemans/ilo-server && cd ilo-server`
-2. `cp .env.example .env`. Set `POSTGRES_PASSWORD` to a long random string, `PUBLIC_URL` to your address, such as `https://sync.example.org`, and `SMTP_URL` and `MAIL_FROM` to your mail account. Remove `DEV_MODE=1`.
+2. `cp .env.example .env`. Set `POSTGRES_PASSWORD` to a long random string, `PUBLIC_URL` to your address, such as `https://sync.example.org`, and `SMTP_URL` and `MAIL_FROM` to your mail account.
 3. `docker compose up -d`
 4. Point your HTTPS proxy at port 8080, and check that `https://sync.example.org/health` says `ok`.
 5. In ilo, set the account server to your address, and sign in.
