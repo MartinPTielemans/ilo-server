@@ -482,6 +482,11 @@ async fn commit_entry(
     else {
         return Ok((refused(InvalidMessage, "the entity has no data type"), None));
     };
+    if entry.deleted() && data_type == NIGORI {
+        // Every store keeps its Nigori; a client resets encryption by
+        // clearing the server data instead.
+        return Ok((refused(InvalidMessage, "Nigori can't be deleted"), None));
+    }
     if entry.deleted() && version == 0 {
         return Ok((
             refused(InvalidMessage, "the server never had this entity"),
@@ -544,7 +549,7 @@ async fn commit_entry(
         stored.deleted = Some(false);
         stored.server_defined_unique_tag = None;
         if data_type == NIGORI {
-            let root = before.as_ref().expect("every store has its Nigori root");
+            let root = before.as_ref().expect("Nigori is never deleted");
             stored.parent_id_string = root.parent_id_string.clone();
             stored.name = root.name.clone();
             stored.server_defined_unique_tag = root.server_defined_unique_tag.clone();

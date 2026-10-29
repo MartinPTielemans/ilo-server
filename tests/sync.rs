@@ -280,3 +280,59 @@ async fn a_long_history_comes_in_batches() {
     }
     assert_eq!((seen, rounds), (550, 2));
 }
+
+#[tokio::test]
+async fn nigori_is_updated_in_place_and_never_deleted() {
+    let server = start().await;
+    let mut mac = server.device(&unique_email("nigori"), "Mac").await;
+    let first = mac.get_updates(vec![marker(NIGORI, None)]).await;
+    let root = first
+        .get_updates
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.server_defined_unique_tag() == "google_chrome_nigori")
+        .unwrap();
+    let passphrase = SyncEntity {
+        id_string: root.id_string.clone(),
+        version: root.version,
+        specifics: Some(encrypted_specifics(NIGORI, b"custom passphrase")),
+        ..Default::default()
+    };
+    let updated = mac
+        .commit(vec![passphrase])
+        .await
+        .commit
+        .unwrap()
+        .entryresponse;
+    assert_eq!(updated[0].response_type(), ResponseType::Success);
+    assert_eq!(updated[0].id_string(), root.id_string());
+
+    let deletion = SyncEntity {
+        id_string: root.id_string.clone(),
+        version: Some(updated[0].version()),
+        deleted: Some(true),
+        specifics: Some(ilo_server::sync::empty_specifics(NIGORI)),
+        ..Default::default()
+    };
+    let refused = mac
+        .commit(vec![deletion])
+        .await
+        .commit
+        .unwrap()
+        .entryresponse;
+    assert_eq!(refused[0].response_type(), ResponseType::InvalidMessage);
+
+    let seen = mac
+        .get_updates(vec![marker(NIGORI, None)])
+        .await
+        .get_updates
+        .unwrap()
+        .entries;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].server_defined_unique_tag(), "google_chrome_nigori");
+    assert_eq!(
+        seen[0].specifics(),
+        encrypted_specifics(NIGORI, b"custom passphrase")
+    );
+}

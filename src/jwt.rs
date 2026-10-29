@@ -20,19 +20,22 @@ pub struct Signer {
 
 impl Signer {
     pub async fn load_or_create(db: &Db) -> anyhow::Result<Self> {
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-        let fresh = EcKey::generate(&group)?;
-        let pem = String::from_utf8(fresh.private_key_to_pem()?)?;
-        // Two instances starting at once agree on the oldest key.
-        sqlx::query(
-            "INSERT INTO signing_keys (id, private_key, created_at) VALUES ($1, $2, $3) \
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(db::random_id())
-        .bind(pem)
-        .bind(db::now())
-        .execute(db)
-        .await?;
+        let existing: Option<i64> = sqlx::query_scalar("SELECT 1 FROM signing_keys LIMIT 1")
+            .fetch_optional(db)
+            .await?;
+        if existing.is_none() {
+            let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+            let pem = String::from_utf8(EcKey::generate(&group)?.private_key_to_pem()?)?;
+            sqlx::query(
+                "INSERT INTO signing_keys (id, private_key, created_at) VALUES ($1, $2, $3)",
+            )
+            .bind(db::random_id())
+            .bind(pem)
+            .bind(db::now())
+            .execute(db)
+            .await?;
+        }
+        // Two instances starting at once on an empty database agree on the oldest key.
         let (id, pem): (String, String) = sqlx::query_as(
             "SELECT id, private_key FROM signing_keys ORDER BY created_at, id LIMIT 1",
         )

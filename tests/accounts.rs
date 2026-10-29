@@ -286,3 +286,37 @@ async fn health_answers_while_the_database_does() {
         .unwrap();
     assert_eq!(response.status(), 200);
 }
+
+#[tokio::test]
+async fn a_restarted_server_keeps_its_signing_key() {
+    let path = std::env::temp_dir().join(format!(
+        "ilo-server-restart-{}.db",
+        ilo_server::db::random_id()
+    ));
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+    let config = || {
+        ilo_server::config::Config::from_lookup(|name| match name {
+            "DEV_MODE" => Some("1".into()),
+            "DATABASE_URL" => Some(url.clone()),
+            _ => None,
+        })
+        .unwrap()
+    };
+    let mut keys = Vec::new();
+    for _ in 0..2 {
+        let state = ilo_server::state(config(), ilo_server::mail::Mailer::Log)
+            .await
+            .unwrap();
+        let rows: Vec<String> = sqlx::query_scalar("SELECT id FROM signing_keys")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        keys.push(rows);
+        state.db.close().await;
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    assert_eq!(keys[0].len(), 1);
+    assert_eq!(keys[0], keys[1]);
+}
