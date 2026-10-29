@@ -9,11 +9,16 @@
 //! which names the data type even when the rest is encrypted.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::{Read, Write};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use flate2::Compression;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
 use prost::Message;
 use sqlx::{Any, Transaction};
 
@@ -36,12 +41,21 @@ const BOOKMARK_FOLDERS: [(&str, &str); 3] = [
     ("synced_bookmarks", "Synced Bookmarks"),
 ];
 
+/// The most a message may be, compressed or not: a commit of Chromium's
+/// largest entities fits many times over. Past it the answer is 413.
+pub const MAX_MESSAGE: usize = 32 * 1024 * 1024;
+
 pub async fn command(
     State(state): State<Shared>,
     Authenticated(device): Authenticated,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Ok(message) = pb::ClientToServerMessage::decode(body) else {
+    let body = match decode_body(&headers, body) {
+        Ok(body) => body,
+        Err(refused) => return refused.into_response(),
+    };
+    let Ok(message) = pb::ClientToServerMessage::decode(body.as_slice()) else {
         return (StatusCode::BAD_REQUEST, "not a ClientToServerMessage").into_response();
     };
     match handle(&state.db, &device, message).await {
@@ -51,11 +65,31 @@ pub async fn command(
                     .relay
                     .notify_changed(&device.account_id, &device.id, &types);
             }
-            (
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                response.encode_to_vec(),
-            )
-                .into_response()
+            let response = response.encode_to_vec();
+            if !accepts_gzip(&headers) {
+                return (
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    response,
+                )
+                    .into_response();
+            }
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            let compressed = encoder.write_all(&response).and_then(|()| encoder.finish());
+            match compressed {
+                Ok(compressed) => (
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream"),
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::VARY, "accept-encoding"),
+                    ],
+                    compressed,
+                )
+                    .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, "can't compress a sync response");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
         Err(Error::BadRequest(reason)) => (StatusCode::BAD_REQUEST, reason).into_response(),
         Err(Error::Internal(error)) => {
@@ -63,6 +97,54 @@ pub async fn command(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Chromium gzips every request body (components/sync/engine/net/http_bridge.cc).
+/// Reading at most one byte past the limit keeps a small body from
+/// expanding into a huge one.
+fn decode_body(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, (StatusCode, &'static str)> {
+    let too_large = (StatusCode::PAYLOAD_TOO_LARGE, "the message is too large");
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .map(|value| value.to_str().unwrap_or("").trim());
+    match encoding {
+        None | Some("identity") => Ok(body.to_vec()),
+        Some(encoding) if encoding.eq_ignore_ascii_case("gzip") => {
+            let mut decoded = Vec::new();
+            MultiGzDecoder::new(body.as_ref())
+                .take(MAX_MESSAGE as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|_| (StatusCode::BAD_REQUEST, "the body isn't valid gzip"))?;
+            if decoded.len() > MAX_MESSAGE {
+                return Err(too_large);
+            }
+            Ok(decoded)
+        }
+        Some(_) => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "only gzip is understood",
+        )),
+    }
+}
+
+/// Chromium's network stack offers gzip itself; a client that doesn't gets the message plain.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|offer| {
+            let mut parts = offer.split(';').map(str::trim);
+            let coding = parts.next().unwrap_or("");
+            let refused = parts.any(|param| {
+                param
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
+                    == Some(0.0)
+            });
+            (coding.eq_ignore_ascii_case("gzip") || coding == "*") && !refused
+        })
 }
 
 pub enum Error {
@@ -681,6 +763,21 @@ mod tests {
         assert_eq!(data_type_of(&encrypted), Some(37702));
         assert_eq!(data_type_of(&[0x0a, 3, 1, 2, 3]), None);
         assert_eq!(data_type_of(&[0x0a, 9, 1]), None);
+    }
+
+    #[test]
+    fn gzip_is_offered_unless_refused() {
+        let offer = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_ENCODING, value.parse().unwrap());
+            accepts_gzip(&headers)
+        };
+        assert!(offer("gzip, deflate, br, zstd"));
+        assert!(offer("br;q=1.0, GZIP;q=0.5"));
+        assert!(offer("*"));
+        assert!(!offer("gzip;q=0"));
+        assert!(!offer("br, zstd"));
+        assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
     #[test]

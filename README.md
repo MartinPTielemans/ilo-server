@@ -8,6 +8,19 @@ Accounts, end-to-end encrypted sync, and a relay between devices for [ilo](https
 
 One binary, configured by environment variables, on SQLite or Postgres.
 
+## What the server can see
+
+ilo turns on a custom passphrase before it first syncs, so Chromium encrypts each item's contents with a key made from it, which never leaves the devices. Under a passphrase, Chromium doesn't sync history, journeys, history deletions, user events or addresses at all. What any server, this one included, still sees:
+
+- **The account:** its email address, and when it was made.
+- **Devices:** the name each sends at sign-in, and when it signed in and was last seen. Chromium also keeps its device records unencrypted: each device's name, operating system and form factor, browser version, and when it was last active.
+- **A few settings:** Chromium's priority preferences, a small set it keeps unencrypted.
+- **Everything else, in outline:** which data types an account syncs, how many items each has, their sizes, when they're created and changed, and how bookmarks nest and are ordered. Not their names, addresses or contents.
+- **The relay:** which of an account's devices message each other, when, and how large the messages are. Not what they say.
+- **The network:** like any web server, the addresses requests come from and when. This server doesn't log them, but a proxy in front of it may.
+
+Sign-in codes and tokens are stored only as hashes.
+
 ## Self-hosting
 
 You need a domain with HTTPS in front of the server, which passkeys require, and an SMTP account to send sign-in codes.

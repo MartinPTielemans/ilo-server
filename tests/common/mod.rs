@@ -21,6 +21,7 @@ pub const REDIRECT: &str = "http://127.0.0.1:47123/callback";
 
 pub struct Server {
     pub url: String,
+    pub db: ilo_server::db::Db,
     pub mail: Arc<Mutex<Vec<Mail>>>,
     database: Option<std::path::PathBuf>,
 }
@@ -61,6 +62,7 @@ pub async fn start() -> Server {
     .unwrap();
     let (mailer, mail) = Mailer::recording();
     let state = ilo_server::state(config, mailer).await.unwrap();
+    let db = state.db.clone();
     tokio::spawn(async move {
         axum::serve(listener, ilo_server::router(state))
             .await
@@ -68,6 +70,7 @@ pub async fn start() -> Server {
     });
     Server {
         url: format!("http://localhost:{port}"),
+        db,
         mail,
         database,
     }
@@ -216,6 +219,22 @@ pub struct Client {
     pub birthday: Option<String>,
 }
 
+pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+pub fn gunzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut decoded)
+        .unwrap();
+    decoded
+}
+
 pub const PREFERENCES: i32 = 37702;
 pub const BOOKMARKS: i32 = 32904;
 pub const NIGORI: i32 = 47745;
@@ -238,27 +257,38 @@ pub fn marker(data_type: i32, token: Option<Vec<u8>>) -> pb::DataTypeProgressMar
 }
 
 impl Client {
+    /// Sends a message as Chromium's engine does: gzipped, offering gzip back.
     pub async fn command(
         &mut self,
         message: pb::ClientToServerMessage,
     ) -> pb::ClientToServerResponse {
-        let response = reqwest::Client::new()
+        let response = self
+            .post_command(gzip(&message.encode_to_vec()), true)
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        let body = gunzip(&response.bytes().await.unwrap());
+        let response = pb::ClientToServerResponse::decode(body.as_slice()).unwrap();
+        if response.error_code() == pb::sync_enums::ErrorType::Success {
+            self.birthday = response.store_birthday.clone();
+        }
+        response
+    }
+
+    pub async fn post_command(&self, body: Vec<u8>, gzipped: bool) -> reqwest::Response {
+        let mut request = reqwest::Client::new()
             .post(format!(
                 "{}/command/?client=Chromium&client_id={}",
                 self.server, self.cache_guid
             ))
             .bearer_auth(&self.access_token)
-            .header("content-type", "application/octet-stream")
-            .body(message.encode_to_vec())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let response = pb::ClientToServerResponse::decode(response.bytes().await.unwrap()).unwrap();
-        if response.error_code() == pb::sync_enums::ErrorType::Success {
-            self.birthday = response.store_birthday.clone();
+            .header("content-type", "application/octet-stream");
+        if gzipped {
+            request = request
+                .header("content-encoding", "gzip")
+                .header("accept-encoding", "gzip, deflate, br, zstd");
         }
-        response
+        request.body(body).send().await.unwrap()
     }
 
     fn message(

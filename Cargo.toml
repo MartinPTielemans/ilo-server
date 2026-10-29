@@ -12,6 +12,7 @@ publish = false
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+flate2 = "1"
 futures-util = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-native-tls", "hostname"] }
 openssl = "0.10"

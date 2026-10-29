@@ -1,8 +1,9 @@
 //! Devices' tokens: what `/token` issues and what sync and the relay accept.
 //!
 //! Tokens are opaque, stored hashed, and belong to a device; removing the
-//! device ends them. Their format is kept to this module until the engine's
-//! sync hooks settle how ilo hands a token to Chromium's sync.
+//! device ends them. ilo's engine hands Chromium's sync the access token as a
+//! Bearer header and refreshes it when it expires or gets a 401, so an expired
+//! or unknown token is a 401, never a 403. The format stays in this module.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;

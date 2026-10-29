@@ -336,3 +336,70 @@ async fn nigori_is_updated_in_place_and_never_deleted() {
         encrypted_specifics(NIGORI, b"custom passphrase")
     );
 }
+
+#[tokio::test]
+async fn a_plain_body_gets_a_plain_answer() {
+    let server = start().await;
+    let mac = server.device(&unique_email("plain"), "Mac").await;
+    let mut message = pb::ClientToServerMessage::default();
+    message.set_message_contents(pb::client_to_server_message::Contents::GetUpdates);
+    message.get_updates = Some(pb::GetUpdatesMessage {
+        from_progress_marker: vec![marker(PREFERENCES, None)],
+        ..Default::default()
+    });
+    let response = mac
+        .post_command(prost::Message::encode_to_vec(&message), false)
+        .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().get("content-encoding").is_none());
+    let response: pb::ClientToServerResponse =
+        prost::Message::decode(response.bytes().await.unwrap()).unwrap();
+    assert_eq!(response.error_code(), ErrorType::Success);
+}
+
+#[tokio::test]
+async fn a_body_that_inflates_past_the_limit_is_refused() {
+    let server = start().await;
+    let mac = server.device(&unique_email("bomb"), "Mac").await;
+    // About 33 KB of gzip that would become 33 MB.
+    let bomb = gzip(&vec![0; ilo_server::sync::MAX_MESSAGE + 1]);
+    assert!(bomb.len() < 100_000);
+    assert_eq!(mac.post_command(bomb, true).await.status(), 413);
+
+    let broken = mac.post_command(b"not gzip".to_vec(), true).await;
+    assert_eq!(broken.status(), 400);
+}
+
+#[tokio::test]
+async fn an_expired_token_gets_401_and_a_refreshed_one_syncs() {
+    let server = start().await;
+    let mut mac = server.device(&unique_email("expired"), "Mac").await;
+    sqlx::query("UPDATE tokens SET expires_at = 0 WHERE token_hash = $1")
+        .bind(ilo_server::db::hash(&mac.access_token))
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let refused = mac.post_command(gzip(b""), true).await;
+    assert_eq!(
+        refused.status(),
+        401,
+        "Chromium refreshes its token on a 401"
+    );
+    assert_eq!(refused.headers()["www-authenticate"], "Bearer");
+
+    let renewed: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/token", server.url))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", mac.refresh_token.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    mac.access_token = renewed["access_token"].as_str().unwrap().to_owned();
+    let synced = mac.get_updates(vec![marker(PREFERENCES, None)]).await;
+    assert_eq!(synced.error_code(), ErrorType::Success);
+}

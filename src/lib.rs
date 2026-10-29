@@ -42,9 +42,6 @@ pub struct AppState {
 
 pub type Shared = Arc<AppState>;
 
-/// Chromium commits a few dozen entities at a time; this leaves room for big ones.
-const SYNC_BODY_LIMIT: usize = 16 * 1024 * 1024;
-
 pub async fn state(config: Config, mailer: Mailer) -> anyhow::Result<Shared> {
     let db = db::connect(&config.database_url).await?;
     let rp_id = config
@@ -96,11 +93,11 @@ pub fn router(state: Shared) -> Router {
         .route("/api/account", delete(devices::delete_account))
         .route(
             "/command/",
-            post(sync::command).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
+            post(sync::command).layer(DefaultBodyLimit::max(sync::MAX_MESSAGE)),
         )
         .route(
             "/command",
-            post(sync::command).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
+            post(sync::command).layer(DefaultBodyLimit::max(sync::MAX_MESSAGE)),
         )
         .route("/relay", get(relay::connect))
         .with_state(state)
