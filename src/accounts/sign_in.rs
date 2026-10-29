@@ -379,7 +379,8 @@ async fn send_code(
     .bind(now + CODE_LIFETIME)
     .execute(&state.db)
     .await?;
-    if let Err(error) = state.mailer.send_code(email, &code).await {
+    let host = state.config.public_url.host_str().unwrap_or_default();
+    if let Err(error) = state.mailer.send_code(email, &code, host).await {
         tracing::warn!(%error, "can't mail a sign-in code");
         sqlx::query("DELETE FROM sign_in_codes WHERE email = $1")
             .bind(email)
