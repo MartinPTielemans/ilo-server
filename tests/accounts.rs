@@ -148,6 +148,87 @@ async fn a_wrong_code_is_refused_and_counts_against_the_limit() {
 }
 
 #[tokio::test]
+async fn tries_sent_at_once_count_against_the_limit_too() {
+    let server = start().await;
+    let email = unique_email("race");
+    let browser = browser();
+    browser
+        .get(server.authorize_url(&pkce(), "s"))
+        .send()
+        .await
+        .unwrap();
+    browser
+        .post(format!("{}/authorize/email", server.url))
+        .form(&[("email", &email)])
+        .send()
+        .await
+        .unwrap();
+    let right = server.last_code(&email);
+    // Thirty different wrong codes at once, as a script guessing would send them.
+    let tries = (0..30).map(|n| {
+        let code = format!("{:06}", (right.parse::<u32>().unwrap() + 1 + n) % 1_000_000);
+        let request = browser
+            .post(format!("{}/authorize/code", server.url))
+            .form(&[("code", code)])
+            .send();
+        async move { request.await.unwrap().text().await.unwrap() }
+    });
+    let pages = futures_util::future::join_all(tries).await;
+    let checked = pages
+        .iter()
+        .filter(|page| page.contains("isn&#39;t right"))
+        .count();
+    assert!(
+        checked <= 5,
+        "{checked} codes were checked, past the limit of 5"
+    );
+    let page = browser
+        .post(format!("{}/authorize/code", server.url))
+        .form(&[("code", &right)])
+        .send()
+        .await
+        .unwrap();
+    assert!(page.text().await.unwrap().contains("Too many tries"));
+}
+
+#[tokio::test]
+async fn an_address_gets_five_codes_an_hour_however_many_sign_ins_ask() {
+    let server = start().await;
+    let email = unique_email("capped");
+    let sent = || server.mail.lock().unwrap().len();
+    for n in 1..=6 {
+        let browser = browser();
+        browser
+            .get(server.authorize_url(&pkce(), "s"))
+            .send()
+            .await
+            .unwrap();
+        let page = browser
+            .post(format!("{}/authorize/email", server.url))
+            .form(&[("email", &email)])
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if n <= 5 {
+            assert_eq!(sent(), n, "sign-in {n} mails a code");
+            assert!(page.contains("Check your email"));
+        } else {
+            assert_eq!(sent(), 5, "the sixth in an hour mails nothing");
+            assert!(page.contains("too many codes"), "{page}");
+        }
+        // Past the wait between two codes to one address.
+        sqlx::query("UPDATE sign_in_codes SET sent_at = sent_at - 60 WHERE email = $1")
+            .bind(&email)
+            .execute(&server.db)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn the_code_flow_needs_pkce_and_a_known_redirect() {
     let server = start().await;
     let unknown = server
