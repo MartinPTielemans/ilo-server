@@ -5,7 +5,9 @@
 //! started it.
 
 use axum::Json;
-use axum::extract::{Form, Query, State};
+use std::net::{IpAddr, SocketAddr};
+
+use axum::extract::{ConnectInfo, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
@@ -33,6 +35,7 @@ const CODES_PER_SIGN_IN: i64 = 2;
 /// each, so guessing one of a million codes takes years, not hours.
 const CODES_PER_ADDRESS_PER_HOUR: i64 = 5;
 const HOUR: i64 = 60 * 60;
+const DAY: i64 = 24 * HOUR;
 pub const AUTHORIZATION_CODE_LIFETIME: i64 = 60;
 
 #[derive(Deserialize)]
@@ -189,8 +192,9 @@ async fn start(
         .bind(now)
         .execute(db)
         .await?;
-    sqlx::query("DELETE FROM code_mailings WHERE hour_started_at < $1")
-        .bind(now - HOUR)
+    // A day is the longest window a limit counts in.
+    sqlx::query("DELETE FROM code_limits WHERE started_at < $1")
+        .bind(now - DAY)
         .execute(db)
         .await?;
     let id = db::random_id();
@@ -254,9 +258,11 @@ pub struct EmailForm {
 
 pub async fn email(
     State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<EmailForm>,
 ) -> Response {
+    let client = client(&state, &headers, peer);
     let sign_in = match current(&state, &headers).await {
         Ok(sign_in) => sign_in,
         Err(response) => return response,
@@ -276,20 +282,25 @@ pub async fn email(
         .await?;
         // Every address gets a code, so the answer doesn't say which have
         // accounts. A passkey signs in from the email page, before any address.
-        send_code(&state, &sign_in.id, &email, false).await
+        send_code(&state, &sign_in.id, &email, &client, false).await
     }
     .await;
     result.unwrap_or_else(internal)
 }
 
-pub async fn send_code_again(State(state): State<Shared>, headers: HeaderMap) -> Response {
+pub async fn send_code_again(
+    State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let client = client(&state, &headers, peer);
     match current(&state, &headers).await {
         Ok(SignIn {
             id,
             email: Some(email),
             codes_sent,
             ..
-        }) => send_code(&state, &id, &email, codes_sent > 0)
+        }) => send_code(&state, &id, &email, &client, codes_sent > 0)
             .await
             .unwrap_or_else(internal),
         Ok(_) => pages::email(None, None),
@@ -297,10 +308,27 @@ pub async fn send_code_again(State(state): State<Shared>, headers: HeaderMap) ->
     }
 }
 
+/// Who asks for codes, as the limits count it: the address the proxy in front names, else the
+/// connection's. An IPv6 client counts by its /64, which one network can hand out at will.
+fn client(state: &Shared, headers: &HeaderMap, peer: SocketAddr) -> String {
+    let named = (state.config.client_ip_header.as_deref())
+        .and_then(|header| headers.get(header)?.to_str().ok())
+        // The last address in a list is the one the proxy itself saw.
+        .and_then(|addresses| addresses.rsplit(',').next()?.trim().parse::<IpAddr>().ok());
+    match named.unwrap_or(peer.ip()).to_canonical() {
+        IpAddr::V4(ip) => format!("client {ip}"),
+        IpAddr::V6(ip) => {
+            let [a, b, c, d, ..] = ip.segments();
+            format!("client {a:x}:{b:x}:{c:x}:{d:x}::/64")
+        }
+    }
+}
+
 async fn send_code(
     state: &Shared,
     sign_in: &str,
     email: &str,
+    client: &str,
     again: bool,
 ) -> anyhow::Result<Response> {
     let now = db::now();
@@ -315,11 +343,8 @@ async fn send_code(
         let note = again.then_some("We sent a code a moment ago. It can take a minute to arrive.");
         return code_page(state, sign_in, email, note, None).await;
     }
-    if !take_mailing(state, email, now).await? {
-        return Ok(pages::email(
-            Some(email),
-            Some("We've sent this address too many codes. Try again in an hour."),
-        ));
+    if let Some(refused) = take_codes(state, email, client, now).await? {
+        return Ok(pages::email(Some(email), Some(refused)));
     }
     let sent: Option<i64> = sqlx::query_scalar(
         "UPDATE sign_ins SET codes_sent = codes_sent + 1 WHERE id = $1 AND codes_sent < $2 RETURNING codes_sent",
@@ -329,7 +354,7 @@ async fn send_code(
     .fetch_optional(&state.db)
     .await?;
     let Some(sent) = sent else {
-        give_back_mailing(state, email).await?;
+        give_back_codes(state, email, client).await?;
         return code_page(
             state,
             sign_in,
@@ -364,7 +389,7 @@ async fn send_code(
             .bind(sign_in)
             .execute(&state.db)
             .await?;
-        give_back_mailing(state, email).await?;
+        give_back_codes(state, email, client).await?;
         return Ok(pages::email(
             Some(email),
             Some("The server couldn't send mail. Try again in a moment."),
@@ -374,33 +399,80 @@ async fn send_code(
     code_page(state, sign_in, email, note, None).await
 }
 
-/// Takes one of the address's codes for the hour, if it has one left. One
-/// statement locks the address's row, so sign-ins asking at once can't all
-/// read a count under the limit before any of them adds to it.
-async fn take_mailing(state: &Shared, email: &str, now: i64) -> anyhow::Result<bool> {
+/// Takes a code from each limit, the address's, the client's and the server's, or none and says
+/// which refused.
+async fn take_codes(
+    state: &Shared,
+    email: &str,
+    client: &str,
+    now: i64,
+) -> anyhow::Result<Option<&'static str>> {
+    let config = &state.config;
+    let limits = [
+        (
+            format!("address {email}"),
+            HOUR,
+            CODES_PER_ADDRESS_PER_HOUR,
+            "We've sent this address too many codes. Try again in an hour.",
+        ),
+        (
+            client.to_owned(),
+            HOUR,
+            config.codes_per_client_per_hour,
+            "We've sent too many codes to sign-ins from your network. Try again in an hour.",
+        ),
+        (
+            "all".to_owned(),
+            DAY,
+            config.codes_per_day,
+            "The server has sent all the codes it can for today. Try again later.",
+        ),
+    ];
+    for (index, (name, window, limit, refused)) in limits.iter().enumerate() {
+        if !take(&state.db, name, now, *window, *limit).await? {
+            for (name, ..) in &limits[..index] {
+                give_back(&state.db, name).await?;
+            }
+            return Ok(Some(refused));
+        }
+    }
+    Ok(None)
+}
+
+/// Gives back the codes `take_codes` took for a mail that was never sent.
+async fn give_back_codes(state: &Shared, email: &str, client: &str) -> anyhow::Result<()> {
+    for name in [&format!("address {email}"), client, "all"] {
+        give_back(&state.db, name).await?;
+    }
+    Ok(())
+}
+
+/// Takes one of the `limit` codes `name` has in its window, if one is left. One statement locks
+/// its row, so sign-ins asking at once can't all read a count under the limit before any of them
+/// adds to it.
+async fn take(db: &Db, name: &str, now: i64, window: i64, limit: i64) -> anyhow::Result<bool> {
     let taken: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO code_mailings (email, hour_started_at, sent) VALUES ($1, $2, 1) \
-         ON CONFLICT (email) DO UPDATE SET \
-         sent = CASE WHEN code_mailings.hour_started_at <= $3 THEN 1 ELSE code_mailings.sent + 1 END, \
-         hour_started_at = CASE WHEN code_mailings.hour_started_at <= $3 THEN $2 \
-         ELSE code_mailings.hour_started_at END \
-         WHERE code_mailings.hour_started_at <= $3 OR code_mailings.sent < $4 \
+        "INSERT INTO code_limits (name, started_at, sent) VALUES ($1, $2, 1) \
+         ON CONFLICT (name) DO UPDATE SET \
+         sent = CASE WHEN code_limits.started_at <= $3 THEN 1 ELSE code_limits.sent + 1 END, \
+         started_at = CASE WHEN code_limits.started_at <= $3 THEN $2 \
+         ELSE code_limits.started_at END \
+         WHERE code_limits.started_at <= $3 OR code_limits.sent < $4 \
          RETURNING sent",
     )
-    .bind(email)
+    .bind(name)
     .bind(now)
-    .bind(now - HOUR)
-    .bind(CODES_PER_ADDRESS_PER_HOUR)
-    .fetch_optional(&state.db)
+    .bind(now - window)
+    .bind(limit)
+    .fetch_optional(db)
     .await?;
     Ok(taken.is_some())
 }
 
-/// Returns a code taken for a mail that was never sent.
-async fn give_back_mailing(state: &Shared, email: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE code_mailings SET sent = sent - 1 WHERE email = $1 AND sent > 0")
-        .bind(email)
-        .execute(&state.db)
+async fn give_back(db: &Db, name: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE code_limits SET sent = sent - 1 WHERE name = $1 AND sent > 0")
+        .bind(name)
+        .execute(db)
         .await?;
     Ok(())
 }

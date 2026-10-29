@@ -11,6 +11,9 @@ services:
       DATABASE_URL: postgres://ilo:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db/ilo
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       DEV_MODE: ${DEV_MODE:-}
+      CLIENT_IP_HEADER: ${CLIENT_IP_HEADER:-}
+      CODES_PER_CLIENT_PER_HOUR: ${CODES_PER_CLIENT_PER_HOUR:-}
+      CODES_PER_DAY: ${CODES_PER_DAY:-}
       SMTP_URL: ${SMTP_URL:-}
       MAIL_FROM: ${MAIL_FROM:-}
     depends_on:

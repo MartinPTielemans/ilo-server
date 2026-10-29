@@ -56,6 +56,8 @@ Back up the database: it holds accounts, the key that signs ID tokens, and the e
 
 The relay is a WebSocket on `/relay`. A proxy in front has to pass `Upgrade` through, and its idle timeout must be longer than 45 seconds, the server's ping interval. nginx needs `proxy_http_version 1.1`, `proxy_set_header Upgrade $http_upgrade` and `proxy_set_header Connection "upgrade"`; Caddy passes WebSockets as they are.
 
+Sign-in counts the codes each client asks for by its address, so a proxy has to name it: set `CLIENT_IP_HEADER` to the header the proxy puts it in, such as `X-Real-IP` with nginx's `proxy_set_header X-Real-IP $remote_addr`, or `X-Forwarded-For`, whose last address counts. Name only a header the proxy sets itself, or a client can claim any address. Without a proxy, leave it unset, and the connection's address counts.
+
 Run one instance. The relay keeps connections in its process.
 
 ## Configuration
@@ -67,6 +69,9 @@ Run one instance. The relay keeps connections in its process.
 | `SMTP_URL` | | Where codes are mailed from, as `smtps://user:password@host:465` or `smtp://user:password@host:587?tls=required`. Required unless `DEV_MODE`. |
 | `MAIL_FROM` | | The codes' sender, such as `ilo <sync@example.org>`. |
 | `DEV_MODE` | off | `1` logs sign-in codes instead of mailing them and allows plain http. Never for real users. |
+| `CLIENT_IP_HEADER` | `X-Real-IP` on Railway, else none | The header the proxy in front puts the client's address in, which the code limits count by; none counts the connection's address. |
+| `CODES_PER_CLIENT_PER_HOUR` | `10` | Sign-in codes mailed in an hour to sign-ins from one client (an IPv6 client by its /64), across every address it asks for. Each address also gets at most 5 an hour. |
+| `CODES_PER_DAY` | `800` | Codes the server mails in a day, all clients together: keep it under your mail account's daily quota, with room for new-sign-in notices. |
 | `OIDC_REDIRECT_URIS` | | More redirect URIs to allow, comma-separated, besides loopback addresses and `$PUBLIC_URL/signed-in`. |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | Where it listens. |
 | `LOG` | `info` | Log filter, such as `debug` or `ilo_server=debug`. |

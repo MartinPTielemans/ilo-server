@@ -42,11 +42,25 @@ impl Drop for Server {
 /// Each test gets a fresh SQLite file, or shares the Postgres in
 /// `ILO_TEST_DATABASE_URL` with addresses no other test uses.
 pub async fn start() -> Server {
+    start_with(&[], true).await
+}
+
+/// A server on a fresh SQLite file, even when the tests share a Postgres, with
+/// `vars` over the tests' settings: for limits that count every sign-in on the
+/// server. Clients name their address in X-Real-IP.
+pub async fn start_alone(vars: &[(&str, &str)]) -> Server {
+    start_with(vars, false).await
+}
+
+async fn start_with(vars: &[(&str, &str)], shared: bool) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (database_url, database) = match std::env::var("ILO_TEST_DATABASE_URL") {
-        Ok(url) => (url, None),
-        Err(_) => {
+    let shared = std::env::var("ILO_TEST_DATABASE_URL")
+        .ok()
+        .filter(|_| shared);
+    let (database_url, database) = match shared {
+        Some(url) => (url, None),
+        None => {
             let path = std::env::temp_dir().join(format!(
                 "ilo-server-test-{}.db",
                 ilo_server::db::random_id()
@@ -54,7 +68,12 @@ pub async fn start() -> Server {
             (format!("sqlite:{}?mode=rwc", path.display()), Some(path))
         }
     };
+    let set = |name: &str| vars.iter().find(|(key, _)| *key == name);
     let config = Config::from_lookup(|name| match name {
+        _ if set(name).is_some() => set(name).map(|(_, value)| value.to_string()),
+        // Tests sign in far more than a client does, and share the server's day on Postgres.
+        "CODES_PER_CLIENT_PER_HOUR" | "CODES_PER_DAY" => Some("1000000".into()),
+        "CLIENT_IP_HEADER" => Some("x-real-ip".into()),
         "DEV_MODE" => Some("1".into()),
         "PORT" => Some(port.to_string()),
         "PUBLIC_URL" => Some(format!("http://localhost:{port}")),
@@ -66,9 +85,12 @@ pub async fn start() -> Server {
     let state = ilo_server::state(config, mailer).await.unwrap();
     let db = state.db.clone();
     tokio::spawn(async move {
-        axum::serve(listener, ilo_server::router(state))
-            .await
-            .unwrap()
+        axum::serve(
+            listener,
+            ilo_server::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
     });
     Server {
         url: format!("http://localhost:{port}"),
