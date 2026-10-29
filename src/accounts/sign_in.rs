@@ -27,6 +27,8 @@ const SIGN_IN_LIFETIME: i64 = 15 * 60;
 const CODE_LIFETIME: i64 = 10 * 60;
 const CODE_RESEND_AFTER: i64 = 30;
 const CODE_ATTEMPTS: i64 = 5;
+/// The first code and one new one.
+const CODES_PER_SIGN_IN: i64 = 2;
 pub const AUTHORIZATION_CODE_LIFETIME: i64 = 60;
 
 #[derive(Deserialize)]
@@ -54,6 +56,8 @@ struct SignIn {
     email: Option<String>,
     account_id: Option<String>,
     ceremony: Option<String>,
+    codes_sent: i64,
+    finished_url: Option<String>,
 }
 
 /// Loopback addresses (RFC 8252), the server's own `/signed-in` page, which
@@ -199,7 +203,16 @@ async fn start(
     Ok(id)
 }
 
+/// The sign-in in progress. Once it's finished, its pages lead to the done page.
 async fn current(state: &Shared, headers: &HeaderMap) -> Result<SignIn, Response> {
+    let sign_in = any(state, headers).await?;
+    if sign_in.finished_url.is_some() {
+        return Err(Redirect::to("/authorize/done").into_response());
+    }
+    Ok(sign_in)
+}
+
+async fn any(state: &Shared, headers: &HeaderMap) -> Result<SignIn, Response> {
     let id = headers
         .get_all(header::COOKIE)
         .iter()
@@ -215,8 +228,8 @@ async fn current(state: &Shared, headers: &HeaderMap) -> Result<SignIn, Response
     };
     let Some(id) = id else { return Err(expired()) };
     let sign_in: Option<SignIn> = sqlx::query_as(
-        "SELECT id, client_id, redirect_uri, state, nonce, code_challenge, scope, email, account_id, ceremony \
-         FROM sign_ins WHERE id = $1 AND created_at > $2",
+        "SELECT id, client_id, redirect_uri, state, nonce, code_challenge, scope, email, account_id, ceremony, \
+         codes_sent, finished_url FROM sign_ins WHERE id = $1 AND created_at > $2",
     )
     .bind(id)
     .bind(db::now() - SIGN_IN_LIFETIME)
@@ -244,8 +257,10 @@ pub async fn email(
         return pages::email(Some(&form.email), Some("That isn't an email address."));
     };
     let result: anyhow::Result<Response> = async {
+        // A corrected address gets its own code and its own resend.
         sqlx::query(
-            "UPDATE sign_ins SET email = $1, account_id = NULL, ceremony = NULL WHERE id = $2",
+            "UPDATE sign_ins SET codes_sent = CASE WHEN email = $1 THEN codes_sent ELSE 0 END, \
+             email = $1, account_id = NULL, ceremony = NULL WHERE id = $2",
         )
         .bind(&email)
         .bind(&sign_in.id)
@@ -254,9 +269,9 @@ pub async fn email(
         if let Some(account) = super::find_by_email(&state.db, &email).await?
             && !super::passkeys(&state.db, &account).await?.is_empty()
         {
-            return Ok(pages::choose(&email));
+            return Ok(pages::choose(&email, None));
         }
-        send_code(&state, &email).await
+        send_code(&state, &sign_in.id, &email, false).await
     }
     .await;
     result.unwrap_or_else(internal)
@@ -265,14 +280,24 @@ pub async fn email(
 pub async fn send_code_again(State(state): State<Shared>, headers: HeaderMap) -> Response {
     match current(&state, &headers).await {
         Ok(SignIn {
-            email: Some(email), ..
-        }) => send_code(&state, &email).await.unwrap_or_else(internal),
+            id,
+            email: Some(email),
+            codes_sent,
+            ..
+        }) => send_code(&state, &id, &email, codes_sent > 0)
+            .await
+            .unwrap_or_else(internal),
         Ok(_) => pages::email(None, None),
         Err(response) => response,
     }
 }
 
-async fn send_code(state: &Shared, email: &str) -> anyhow::Result<Response> {
+async fn send_code(
+    state: &Shared,
+    sign_in: &str,
+    email: &str,
+    again: bool,
+) -> anyhow::Result<Response> {
     let now = db::now();
     // Reloading the page or pressing twice doesn't mail again.
     let recent: Option<i64> =
@@ -282,8 +307,26 @@ async fn send_code(state: &Shared, email: &str) -> anyhow::Result<Response> {
             .fetch_optional(&state.db)
             .await?;
     if recent.is_some() {
-        return Ok(pages::code(email, None));
+        let note = again.then_some("We sent a code a moment ago. It can take a minute to arrive.");
+        return code_page(state, sign_in, email, note, None).await;
     }
+    let sent: Option<i64> = sqlx::query_scalar(
+        "UPDATE sign_ins SET codes_sent = codes_sent + 1 WHERE id = $1 AND codes_sent < $2 RETURNING codes_sent",
+    )
+    .bind(sign_in)
+    .bind(CODES_PER_SIGN_IN)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(sent) = sent else {
+        return code_page(
+            state,
+            sign_in,
+            email,
+            None,
+            Some("We can't send another code. If it hasn't arrived, start again from ilo."),
+        )
+        .await;
+    };
     let code = format!(
         "{:06}",
         u64::from_le_bytes(db::random_bytes::<8>()) % 1_000_000
@@ -305,12 +348,49 @@ async fn send_code(state: &Shared, email: &str) -> anyhow::Result<Response> {
             .bind(email)
             .execute(&state.db)
             .await?;
+        sqlx::query("UPDATE sign_ins SET codes_sent = codes_sent - 1 WHERE id = $1")
+            .bind(sign_in)
+            .execute(&state.db)
+            .await?;
         return Ok(pages::email(
             Some(email),
             Some("The server couldn't send mail. Try again in a moment."),
         ));
     }
-    Ok(pages::code(email, None))
+    let note = (sent > 1).then_some("We sent a new code.");
+    code_page(state, sign_in, email, note, None).await
+}
+
+/// The code page, saying when the code expires and whether a new one can be sent.
+async fn code_page(
+    state: &Shared,
+    sign_in: &str,
+    email: &str,
+    note: Option<&str>,
+    error: Option<&str>,
+) -> anyhow::Result<Response> {
+    let codes_sent: i64 = sqlx::query_scalar("SELECT codes_sent FROM sign_ins WHERE id = $1")
+        .bind(sign_in)
+        .fetch_one(&state.db)
+        .await?;
+    let expires_at: Option<i64> =
+        sqlx::query_scalar("SELECT expires_at FROM sign_in_codes WHERE email = $1")
+            .bind(email)
+            .fetch_optional(&state.db)
+            .await?;
+    let left = expires_at.map_or(0, |at| at - db::now());
+    let page = pages::code(pages::Code {
+        email,
+        minutes: (left + 59) / 60,
+        resend: codes_sent < CODES_PER_SIGN_IN,
+        note,
+        error,
+    });
+    Ok(if error.is_some() {
+        (StatusCode::BAD_REQUEST, page).into_response()
+    } else {
+        page
+    })
 }
 
 #[derive(Deserialize)]
@@ -330,6 +410,7 @@ pub async fn code(
     let Some(email) = sign_in.email.clone() else {
         return pages::email(None, None);
     };
+    let can_resend = sign_in.codes_sent < CODES_PER_SIGN_IN;
     let result: anyhow::Result<Response> = async {
         let row: Option<(String, i64, i64)> = sqlx::query_as(
             "SELECT code_hash, expires_at, attempts FROM sign_in_codes WHERE email = $1",
@@ -337,19 +418,24 @@ pub async fn code(
         .bind(&email)
         .fetch_optional(&state.db)
         .await?;
+        let refused = |error| code_page(&state, &sign_in.id, &email, None, Some(error));
         let Some((code_hash, _, attempts)) =
             row.filter(|(_, expires_at, _)| *expires_at > db::now())
         else {
-            return Ok(pages::code(
-                &email,
-                Some("That code has expired. Send a new one."),
-            ));
+            return refused(if can_resend {
+                "That code has expired. Send a new one."
+            } else {
+                "That code has expired. Start again from ilo."
+            })
+            .await;
         };
         if attempts >= CODE_ATTEMPTS {
-            return Ok(pages::code(
-                &email,
-                Some("Too many tries. Send a new code."),
-            ));
+            return refused(if can_resend {
+                "Too many tries. Send a new code."
+            } else {
+                "Too many tries. Start again from ilo."
+            })
+            .await;
         }
         let typed: String = form.code.chars().filter(|c| !c.is_whitespace()).collect();
         if db::hash(&typed) != code_hash {
@@ -357,7 +443,7 @@ pub async fn code(
                 .bind(&email)
                 .execute(&state.db)
                 .await?;
-            return Ok(pages::code(&email, Some("That code isn't right.")));
+            return refused("That code isn't right.").await;
         }
         sqlx::query("DELETE FROM sign_in_codes WHERE email = $1")
             .bind(&email)
@@ -369,15 +455,28 @@ pub async fn code(
             .bind(&sign_in.id)
             .execute(&state.db)
             .await?;
-        if super::passkeys(&state.db, &account).await?.is_empty() {
+        if super::passkeys(&state.db, &account).await?.is_empty()
+            && offer_passkey(&state.db, &account).await?
+        {
             return Ok(pages::add_passkey());
         }
-        finish(&state, &sign_in, &account)
-            .await
-            .map(|url| redirect(&state.config, &url))
+        finish(&state, &sign_in, &account).await?;
+        Ok(to_done())
     }
     .await;
     result.unwrap_or_else(internal)
+}
+
+/// Whether to offer a passkey: once per account, after its first sign-in, so
+/// "Not now" isn't asked again at every sign-in after.
+async fn offer_passkey(db: &Db, account: &str) -> anyhow::Result<bool> {
+    let marked = sqlx::query(
+        "UPDATE accounts SET passkey_offered = 1 WHERE id = $1 AND passkey_offered = 0",
+    )
+    .bind(account)
+    .execute(db)
+    .await?;
+    Ok(marked.rows_affected() == 1)
 }
 
 /// "Not now" on the passkey page.
@@ -386,7 +485,7 @@ pub async fn skip_passkey(State(state): State<Shared>, headers: HeaderMap) -> Re
         Ok(sign_in) => match sign_in.account_id.clone() {
             Some(account) => finish(&state, &sign_in, &account)
                 .await
-                .map(|url| redirect(&state.config, &url))
+                .map(|()| to_done())
                 .unwrap_or_else(internal),
             None => pages::email(sign_in.email.as_deref(), None),
         },
@@ -394,16 +493,16 @@ pub async fn skip_passkey(State(state): State<Shared>, headers: HeaderMap) -> Re
     }
 }
 
-fn redirect(config: &Config, url: &str) -> Response {
-    (
-        [(header::SET_COOKIE, cookie(config, "", 0))],
-        Redirect::to(url),
-    )
-        .into_response()
+/// Forms end on the done page rather than redirecting straight to the app:
+/// `form-action 'self'` covers a form's redirects too, and the page shows the
+/// user where they are going.
+fn to_done() -> Response {
+    Redirect::to("/authorize/done").into_response()
 }
 
-/// Ends the sign-in with an authorization code for the app to exchange at `/token`.
-async fn finish(state: &Shared, sign_in: &SignIn, account: &str) -> anyhow::Result<String> {
+/// Ends the sign-in with an authorization code for the app to exchange at
+/// `/token`, which the done page hands it.
+async fn finish(state: &Shared, sign_in: &SignIn, account: &str) -> anyhow::Result<()> {
     let code = db::random_id();
     sqlx::query(
         "INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, nonce, code_challenge, scope, account_id, expires_at) \
@@ -419,16 +518,44 @@ async fn finish(state: &Shared, sign_in: &SignIn, account: &str) -> anyhow::Resu
     .bind(db::now() + AUTHORIZATION_CODE_LIFETIME)
     .execute(&state.db)
     .await?;
-    sqlx::query("DELETE FROM sign_ins WHERE id = $1")
-        .bind(&sign_in.id)
-        .execute(&state.db)
-        .await?;
     let issuer = state.config.issuer();
     let mut reply = vec![("code", code.as_str()), ("iss", issuer.as_str())];
     if let Some(sent) = sign_in.state.as_deref() {
         reply.push(("state", sent));
     }
-    Ok(redirect_with(&sign_in.redirect_uri, &reply))
+    sqlx::query("UPDATE sign_ins SET finished_url = $1, ceremony = NULL WHERE id = $2")
+        .bind(redirect_with(&sign_in.redirect_uri, &reply))
+        .bind(&sign_in.id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+/// The done page, once: it ends the sign-in and takes the tab back to the app.
+pub async fn done(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let sign_in = match any(&state, &headers).await {
+        Ok(sign_in) => sign_in,
+        Err(response) => return response,
+    };
+    let (Some(url), Some(email)) = (sign_in.finished_url, sign_in.email) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            pages::failure("This sign-in isn't finished."),
+        )
+            .into_response();
+    };
+    let deleted = sqlx::query("DELETE FROM sign_ins WHERE id = $1")
+        .bind(&sign_in.id)
+        .execute(&state.db)
+        .await;
+    if let Err(error) = deleted {
+        return internal(error.into());
+    }
+    (
+        [(header::SET_COOKIE, cookie(&state.config, "", 0))],
+        pages::done(&email, &url),
+    )
+        .into_response()
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
@@ -452,12 +579,8 @@ async fn save_ceremony(db: &Db, sign_in: &str, ceremony: Option<String>) -> anyh
     Ok(())
 }
 
-fn finished(config: &Config, url: String) -> Response {
-    (
-        [(header::SET_COOKIE, cookie(config, "", 0))],
-        Json(json!({ "redirect": url })),
-    )
-        .into_response()
+fn finished() -> Response {
+    Json(json!({ "redirect": "/authorize/done" })).into_response()
 }
 
 pub async fn register_start(State(state): State<Shared>, headers: HeaderMap) -> Response {
@@ -523,7 +646,8 @@ pub async fn register_finish(
             .bind(db::now())
             .execute(&state.db)
             .await?;
-        Ok(finished(&state.config, finish(&state, &sign_in, &account).await?))
+        finish(&state, &sign_in, &account).await?;
+        Ok(finished())
     }
     .await;
     result.unwrap_or_else(json_internal)
@@ -610,10 +734,8 @@ pub async fn login_finish(
                     .await?;
             }
         }
-        Ok(finished(
-            &state.config,
-            finish(&state, &sign_in, &account).await?,
-        ))
+        finish(&state, &sign_in, &account).await?;
+        Ok(finished())
     }
     .await;
     result.unwrap_or_else(json_internal)

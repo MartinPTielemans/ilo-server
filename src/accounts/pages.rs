@@ -1,7 +1,17 @@
-//! The sign-in pages ilo shows in a tab. Plain HTML, one small script for passkeys.
+//! The sign-in pages ilo shows in a tab. Plain HTML from the server, one
+//! stylesheet, and one small script for passkeys.
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
+
+/// Nothing inline: the stylesheet and the script come from the server itself,
+/// forms post only to it, and no other site can frame the pages.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// ilo's mark, the dot and the stem from its icon (the browser's
+/// `app/branding/ilo.icon`), with the stem in the page's ink.
+const MARK: &str = r##"<svg class="mark" viewBox="419.8 184.3 184.4 624.7" role="img" aria-label="ilo"><circle cx="512" cy="276.5" r="92.2" fill="#0E9F55"/><rect x="445.4" y="450.6" width="133.1" height="358.4" rx="66.6" fill="currentColor"/></svg>"##;
 
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -11,50 +21,42 @@ fn escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn page(title: &str, body: &str) -> Response {
+fn page(title: &str, head: &str, body: &str) -> Response {
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · ilo</title>
-<style>
-:root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
-body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; }}
-main {{ width: min(22rem, 100% - 2rem); }}
-h1 {{ font-size: 1.4rem; margin: 0 0 .5rem; }}
-p {{ line-height: 1.45; }}
-form {{ display: grid; gap: .6rem; margin: 1rem 0 0; }}
-input, button {{ font: inherit; padding: .6rem .7rem; border-radius: .5rem; }}
-input {{ border: 1px solid #8886; }}
-button {{ border: 0; background: #3d5afe; color: white; cursor: pointer; }}
-button.quiet {{ background: none; color: inherit; text-decoration: underline; padding: 0; justify-self: start; }}
-.error {{ color: #d32f2f; }}
-</style>
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+{head}<title>{title} · ilo</title>
+<link rel="stylesheet" href="/sign-in.css">
 <script src="/sign-in.js" defer></script>
 </head>
-<body><main>
+<body>
+<main>
+{MARK}
 <h1>{title}</h1>
 {body}
-</main></body>
-</html>"#
+</main>
+</body>
+</html>
+"#
     );
     (
         [
             (header::CACHE_CONTROL, "no-store"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
-                 connect-src 'self'; frame-ancestors 'none'",
-            ),
+            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         Html(html),
     )
         .into_response()
 }
 
-fn error_line(error: Option<&str>) -> String {
+fn alert(error: Option<&str>) -> String {
     error
         .map(|error| format!(r#"<p class="error" role="alert">{}</p>"#, escape(error)))
         .unwrap_or_default()
@@ -63,6 +65,7 @@ fn error_line(error: Option<&str>) -> String {
 pub fn email(hint: Option<&str>, error: Option<&str>) -> Response {
     page(
         "Sign in to ilo",
+        "",
         &format!(
             r#"<p>Sync your browser between your devices. Enter your email, and we'll send you a code.</p>
 {}
@@ -70,38 +73,67 @@ pub fn email(hint: Option<&str>, error: Option<&str>) -> Response {
 <input name="email" type="email" autocomplete="email webauthn" required autofocus placeholder="you@example.com" value="{}" aria-label="Email">
 <button>Continue</button>
 </form>"#,
-            error_line(error),
+            alert(error),
             escape(hint.unwrap_or_default())
         ),
     )
 }
 
-pub fn choose(email: &str) -> Response {
+/// The account has a passkey, so it's the first way offered.
+pub fn choose(email: &str, error: Option<&str>) -> Response {
     page(
         "Sign in to ilo",
+        "",
         &format!(
-            r#"<p>Signing in as {}.</p>
-<p class="error" id="passkey-error" role="alert" hidden></p>
+            r#"<p>Signing in as <strong>{}</strong>.</p>
+{}<p class="error" id="passkey-error" role="alert" hidden></p>
 <form><button type="button" data-passkey="login" autofocus>Use your passkey</button></form>
 <form method="post" action="/authorize/send-code"><button class="quiet">Email me a code instead</button></form>"#,
-            escape(email)
+            escape(email),
+            alert(error)
         ),
     )
 }
 
-pub fn code(email: &str, error: Option<&str>) -> Response {
+pub struct Code<'a> {
+    pub email: &'a str,
+    /// Until the code expires, rounded up: 0 once it has.
+    pub minutes: i64,
+    /// Whether the one new code a sign-in may ask for is still unsent.
+    pub resend: bool,
+    /// Said once a new code is sent.
+    pub note: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+pub fn code(sent: Code) -> Response {
+    let expires = match sent.minutes {
+        ..=0 => "It has expired.".to_owned(),
+        1 => "It expires in 1 minute.".to_owned(),
+        minutes => format!("It expires in {minutes} minutes."),
+    };
+    let note = sent
+        .note
+        .map(|note| format!(r#"<p class="note" role="status">{}</p>"#, escape(note)))
+        .unwrap_or_default();
+    let resend = if sent.resend {
+        r#"<form method="post" action="/authorize/send-code"><button class="link">Send a new code</button></form>"#
+    } else {
+        ""
+    };
     page(
         "Check your email",
+        "",
         &format!(
-            r#"<p>We sent a code to {}. It works for 10 minutes.</p>
-{}
+            r#"<p>We sent a 6-digit code to <strong>{}</strong>. {expires}</p>
+{note}{}
 <form method="post" action="/authorize/code">
-<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" required autofocus aria-label="Code">
+<input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="12" required autofocus placeholder="000000" aria-label="Code">
 <button>Sign in</button>
 </form>
-<form method="post" action="/authorize/send-code"><button class="quiet">Send a new code</button></form>"#,
-            escape(email),
-            error_line(error)
+{resend}"#,
+            escape(sent.email),
+            alert(sent.error)
         ),
     )
 }
@@ -109,6 +141,7 @@ pub fn code(email: &str, error: Option<&str>) -> Response {
 pub fn add_passkey() -> Response {
     page(
         "Add a passkey",
+        "",
         r#"<p>Next time, sign in with your fingerprint, face or device PIN instead of a code.</p>
 <p class="error" id="passkey-error" role="alert" hidden></p>
 <form><button type="button" data-passkey="register" autofocus>Add a passkey</button></form>
@@ -116,24 +149,52 @@ pub fn add_passkey() -> Response {
     )
 }
 
+/// Shown for a moment before the tab goes back to the app with its code.
+pub fn done(email: &str, url: &str) -> Response {
+    let url = escape(url);
+    page(
+        "You're signed in",
+        &format!("<meta http-equiv=\"refresh\" content=\"1; url={url}\">\n"),
+        &format!(
+            r#"<p>Signed in as <strong>{}</strong>. Taking you back to ilo.</p>
+<div class="actions"><a class="button" href="{url}">Return to ilo</a></div>"#,
+            escape(email)
+        ),
+    )
+}
+
 pub fn failure(message: &str) -> Response {
     page(
         "Can't sign in",
-        &format!("<p>{}</p><p>Start again from ilo.</p>", escape(message)),
+        "",
+        &format!(
+            r#"<p role="alert">{}</p>
+<p>Start again from ilo.</p>"#,
+            escape(message)
+        ),
     )
 }
 
 pub fn signed_in() -> Response {
-    page("You're signed in", "<p>You can close this tab.</p>")
+    page("You're signed in", "", "<p>You can close this tab.</p>")
+}
+
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 pub async fn script() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        include_str!("sign-in.js"),
-    )
-        .into_response()
+    asset("text/javascript; charset=utf-8", include_str!("sign-in.js"))
+}
+
+pub async fn style() -> Response {
+    asset("text/css; charset=utf-8", include_str!("sign-in.css"))
 }

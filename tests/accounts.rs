@@ -241,28 +241,13 @@ async fn refreshing_rotates_the_refresh_token_and_revoking_signs_the_device_out(
 }
 
 #[tokio::test]
-async fn a_signed_in_account_can_start_adding_a_passkey() {
+async fn a_passkey_is_offered_once_after_the_first_sign_in() {
     let server = start().await;
     let email = unique_email("passkey");
     let browser = browser();
-    browser
-        .get(server.authorize_url(&pkce(), "s"))
-        .send()
-        .await
-        .unwrap();
-    browser
-        .post(format!("{}/authorize/email", server.url))
-        .form(&[("email", &email)])
-        .send()
-        .await
-        .unwrap();
-    let code = server.last_code(&email);
-    browser
-        .post(format!("{}/authorize/code", server.url))
-        .form(&[("code", code)])
-        .send()
-        .await
-        .unwrap();
+    let offer = server.enter_code(&browser, &email, &pkce()).await;
+    assert_eq!(offer.status(), 200);
+    assert!(offer.text().await.unwrap().contains("Not now"));
 
     // The ceremony's options, which the page hands to navigator.credentials.create.
     let options: Value = browser
@@ -276,6 +261,175 @@ async fn a_signed_in_account_can_start_adding_a_passkey() {
         .unwrap();
     assert_eq!(options["publicKey"]["rp"]["id"], "localhost");
     assert_eq!(options["publicKey"]["user"]["name"], email);
+
+    let again = common::browser();
+    let finished = server.enter_code(&again, &email, &pkce()).await;
+    assert_eq!(
+        finished.status(),
+        303,
+        "the second sign-in goes straight on"
+    );
+    server.done(&again, finished).await;
+}
+
+#[tokio::test]
+async fn the_code_page_says_when_it_expires_and_sends_one_new_code() {
+    let server = start().await;
+    let email = unique_email("resend");
+    let browser = browser();
+    browser
+        .get(server.authorize_url(&pkce(), "state-1"))
+        .send()
+        .await
+        .unwrap();
+    let page = browser
+        .post(format!("{}/authorize/email", server.url))
+        .form(&[("email", &email)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("It expires in 10 minutes."));
+    assert!(page.contains("Send a new code"));
+    let first = server.last_code(&email);
+    let send_again = || async {
+        browser
+            .post(format!("{}/authorize/send-code", server.url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    let sent = || server.mail.lock().unwrap().len();
+
+    let page = send_again().await;
+    assert!(
+        page.contains("a moment ago"),
+        "pressing at once mails nothing"
+    );
+    assert_eq!(sent(), 1);
+
+    let a_minute_ago = || async {
+        sqlx::query("UPDATE sign_in_codes SET sent_at = sent_at - 60 WHERE email = $1")
+            .bind(&email)
+            .execute(&server.db)
+            .await
+            .unwrap();
+    };
+    a_minute_ago().await;
+    let page = send_again().await;
+    assert_eq!(sent(), 2);
+    assert!(page.contains("We sent a new code."));
+    assert!(!page.contains("Send a new code"), "one new code, no more");
+
+    a_minute_ago().await;
+    let page = send_again().await;
+    assert_eq!(sent(), 2);
+    assert!(page.contains("can&#39;t send another code"));
+
+    let code = |code: String| {
+        browser
+            .post(format!("{}/authorize/code", server.url))
+            .form(&[("code", code)])
+            .send()
+    };
+    let new = server.last_code(&email);
+    if new != first {
+        let refused = code(first).await.unwrap();
+        assert_eq!(refused.status(), 400, "the new code replaces the first");
+    }
+    let offer = code(new).await.unwrap();
+    assert!(offer.text().await.unwrap().contains("Add a passkey"));
+}
+
+#[tokio::test]
+async fn the_done_page_hands_the_code_back_once() {
+    let server = start().await;
+    let email = unique_email("done");
+    let browser = browser();
+    server.enter_code(&browser, &email, &pkce()).await;
+    let finished = browser
+        .post(format!("{}/authorize/continue", server.url))
+        .send()
+        .await
+        .unwrap();
+
+    // Going back to a step of a finished sign-in leads to its done page.
+    let back = browser
+        .post(format!("{}/authorize/code", server.url))
+        .form(&[("code", "000000")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(back.headers()["location"], "/authorize/done");
+
+    server.done(&browser, finished).await;
+    let again = browser
+        .get(format!("{}/authorize/done", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 400);
+    assert!(again.text().await.unwrap().contains("Can't sign in"));
+}
+
+#[tokio::test]
+async fn the_pages_run_nothing_inline_and_send_no_referrer() {
+    let server = start().await;
+    let page = browser()
+        .get(server.authorize_url(&pkce(), "s"))
+        .send()
+        .await
+        .unwrap();
+    let policy = page.headers()["content-security-policy"].to_str().unwrap();
+    for directive in [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ] {
+        assert!(policy.contains(directive), "{directive} in {policy}");
+    }
+    assert!(!policy.contains("unsafe"));
+    assert_eq!(page.headers()["referrer-policy"], "no-referrer");
+    let html = page.text().await.unwrap();
+    assert_eq!(html.matches("<script").count(), 1);
+    assert!(html.contains(r#"<script src="/sign-in.js" defer></script>"#));
+    assert!(!html.contains("<style") && !html.contains(" style="));
+
+    for (path, kind) in [
+        ("/sign-in.css", "text/css"),
+        ("/sign-in.js", "text/javascript"),
+    ] {
+        let asset = reqwest::get(format!("{}{path}", server.url)).await.unwrap();
+        assert_eq!(asset.status(), 200);
+        let content_type = asset.headers()["content-type"].to_str().unwrap();
+        assert!(content_type.starts_with(kind), "{path} is {content_type}");
+    }
+}
+
+#[tokio::test]
+async fn a_mailed_code_signs_a_device_in_to_sync() {
+    let server = start().await;
+    let mut device = server.device(&unique_email("sync"), "Test").await;
+    let response = device.get_updates(vec![marker(NIGORI, None)]).await;
+    assert_eq!(
+        response.error_code(),
+        ilo_server::pb::sync_enums::ErrorType::Success
+    );
+    let updates = response.get_updates.unwrap();
+    assert!(
+        updates
+            .entries
+            .iter()
+            .any(|entity| entity.server_defined_unique_tag() == "google_chrome_nigori")
+    );
+    assert!(!updates.encryption_keys.is_empty());
 }
 
 #[tokio::test]
