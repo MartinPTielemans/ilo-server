@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::json;
 use url::Url;
 use webauthn_rs::prelude::{
-    PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
-    Uuid,
+    DiscoverableAuthentication, DiscoverableKey, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, Uuid,
 };
 
 use super::pages;
@@ -274,11 +274,8 @@ pub async fn email(
         .bind(&sign_in.id)
         .execute(&state.db)
         .await?;
-        if let Some(account) = super::find_by_email(&state.db, &email).await?
-            && !super::passkeys(&state.db, &account).await?.is_empty()
-        {
-            return Ok(pages::choose(&email, None));
-        }
+        // Every address gets a code, so the answer doesn't say which have
+        // accounts. A passkey signs in from the email page, before any address.
         send_code(&state, &sign_in.id, &email, false).await
     }
     .await;
@@ -656,6 +653,13 @@ pub async fn register_start(State(state): State<Shared>, headers: HeaderMap) -> 
             &email,
             Some(exclude),
         )?;
+        // Discoverable, so signing in can ask the authenticator which account
+        // it holds instead of the server naming an address's credentials.
+        // Finishing doesn't check this, so the ceremony itself is unchanged.
+        let mut options = serde_json::to_value(options)?;
+        let selection = &mut options["publicKey"]["authenticatorSelection"];
+        selection["residentKey"] = json!("required");
+        selection["requireResidentKey"] = json!(true);
         save_ceremony(
             &state.db,
             &sign_in.id,
@@ -710,29 +714,17 @@ fn credential_id(id: &impl AsRef<[u8]>) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id)
 }
 
+/// Starts a passkey sign-in without an address: the authenticator offers the
+/// passkeys it holds for ilo, so the server names no account's credentials.
 pub async fn login_start(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let sign_in = match current(&state, &headers).await {
         Ok(sign_in) => sign_in,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "This sign-in has expired."),
     };
-    let Some(email) = sign_in.email.clone() else {
-        return json_error(StatusCode::BAD_REQUEST, "Enter your email first.");
-    };
     let result: anyhow::Result<Response> = async {
-        let Some(account) = super::find_by_email(&state.db, &email).await? else {
-            return Ok(json_error(
-                StatusCode::BAD_REQUEST,
-                "This account has no passkey.",
-            ));
-        };
-        let passkeys = super::passkeys(&state.db, &account).await?;
-        if passkeys.is_empty() {
-            return Ok(json_error(
-                StatusCode::BAD_REQUEST,
-                "This account has no passkey.",
-            ));
-        }
-        let (options, authentication) = state.webauthn.start_passkey_authentication(&passkeys)?;
+        let (mut options, authentication) = state.webauthn.start_discoverable_authentication()?;
+        // The page asks when the button is pressed, not from the email field's autofill.
+        options.mediation = None;
         save_ceremony(
             &state.db,
             &sign_in.id,
@@ -754,30 +746,36 @@ pub async fn login_finish(
         Ok(sign_in) => sign_in,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "This sign-in has expired."),
     };
-    let (Some(email), Some(ceremony)) = (sign_in.email.clone(), sign_in.ceremony.clone()) else {
+    let Some(ceremony) = sign_in.ceremony.clone() else {
         return json_error(StatusCode::BAD_REQUEST, "Start the passkey sign-in again.");
     };
+    let refused = || json_error(StatusCode::BAD_REQUEST, "The passkey wasn't accepted.");
     let result: anyhow::Result<Response> = async {
         save_ceremony(&state.db, &sign_in.id, None).await?;
-        let authentication: PasskeyAuthentication = serde_json::from_str(&ceremony)?;
-        let outcome = match state
+        let authentication: DiscoverableAuthentication = serde_json::from_str(&ceremony)?;
+        // The passkey names its account; only that account's passkeys can sign it.
+        let Ok((user, _)) = state
             .webauthn
-            .finish_passkey_authentication(&credential, &authentication)
-        {
+            .identify_discoverable_authentication(&credential)
+        else {
+            return Ok(refused());
+        };
+        let account = user.to_string();
+        let passkeys = super::passkeys(&state.db, &account).await?;
+        let keys: Vec<DiscoverableKey> = passkeys.iter().map(DiscoverableKey::from).collect();
+        let outcome = match state.webauthn.finish_discoverable_authentication(
+            &credential,
+            authentication,
+            &keys,
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::info!(%error, "a passkey sign-in was refused");
-                return Ok(json_error(
-                    StatusCode::BAD_REQUEST,
-                    "The passkey wasn't accepted.",
-                ));
+                return Ok(refused());
             }
         };
-        let account = super::find_by_email(&state.db, &email)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("account gone"))?;
         // The counter and backup state change with each use.
-        for mut passkey in super::passkeys(&state.db, &account).await? {
+        for mut passkey in passkeys {
             if passkey.update_credential(&outcome) == Some(true) {
                 sqlx::query("UPDATE passkeys SET passkey = $1 WHERE credential_id = $2")
                     .bind(serde_json::to_string(&passkey)?)
@@ -786,6 +784,13 @@ pub async fn login_finish(
                     .await?;
             }
         }
+        // The done page names the account signed in to, whatever address was typed.
+        sqlx::query("UPDATE sign_ins SET email = $1, account_id = $2 WHERE id = $3")
+            .bind(super::email(&state.db, &account).await?)
+            .bind(&account)
+            .bind(&sign_in.id)
+            .execute(&state.db)
+            .await?;
         finish(&state, &sign_in, &account).await?;
         Ok(finished())
     }

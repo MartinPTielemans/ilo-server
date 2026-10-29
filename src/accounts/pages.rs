@@ -72,25 +72,11 @@ pub fn email(hint: Option<&str>, error: Option<&str>) -> Response {
 <form method="post" action="/authorize/email">
 <input name="email" type="email" autocomplete="email webauthn" required autofocus placeholder="you@example.com" value="{}" aria-label="Email">
 <button>Continue</button>
-</form>"#,
+</form>
+<p class="error" id="passkey-error" role="alert" hidden></p>
+<form><button type="button" class="quiet" data-passkey="login">Use a passkey</button></form>"#,
             alert(error),
             escape(hint.unwrap_or_default())
-        ),
-    )
-}
-
-/// The account has a passkey, so it's the first way offered.
-pub fn choose(email: &str, error: Option<&str>) -> Response {
-    page(
-        "Sign in to ilo",
-        "",
-        &format!(
-            r#"<p>Signing in as <strong>{}</strong>.</p>
-{}<p class="error" id="passkey-error" role="alert" hidden></p>
-<form><button type="button" data-passkey="login" autofocus>Use your passkey</button></form>
-<form method="post" action="/authorize/send-code"><button class="quiet">Email me a code instead</button></form>"#,
-            escape(email),
-            alert(error)
         ),
     )
 }

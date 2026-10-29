@@ -402,6 +402,145 @@ async fn a_passkey_is_offered_once_after_the_first_sign_in() {
 }
 
 #[tokio::test]
+async fn the_email_step_answers_alike_whether_or_not_an_address_has_a_passkey() {
+    let server = start().await;
+    let with = unique_email("has-passkey");
+    server.add_passkey(&with).await;
+    sqlx::query("UPDATE sign_in_codes SET sent_at = sent_at - 60")
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let answer = |email: String| {
+        let server = &server;
+        async move {
+            let browser = browser();
+            browser
+                .get(server.authorize_url(&pkce(), "s"))
+                .send()
+                .await
+                .unwrap();
+            let page = browser
+                .post(format!("{}/authorize/email", server.url))
+                .form(&[("email", &email)])
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            page.replace(&email, "ADDRESS")
+        }
+    };
+    let without = answer(unique_email("no-account")).await;
+    assert!(without.contains("Check your email"));
+    assert_eq!(answer(with).await, without);
+}
+
+#[tokio::test]
+async fn a_passkey_signs_in_without_an_address_or_its_credential_ids() {
+    let server = start().await;
+    let email = unique_email("discoverable");
+    let mut passkey = server.add_passkey(&email).await;
+
+    let browser = browser();
+    let pkce = pkce();
+    browser
+        .get(server.authorize_url(&pkce, "state-1"))
+        .send()
+        .await
+        .unwrap();
+    let options: Value = browser
+        .post(format!("{}/authorize/passkey/login", server.url))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let named = options["publicKey"]["allowCredentials"]
+        .as_array()
+        .map_or(0, Vec::len);
+    assert_eq!(named, 0, "the server names no credential: {options}");
+
+    let finished: Value = browser
+        .post(format!("{}/authorize/passkey/login/finish", server.url))
+        .json(&passkey.get(&options, &server.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(finished["redirect"], "/authorize/done");
+    let page = browser
+        .get(format!("{}/authorize/done", server.url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(&email), "the account is the passkey's");
+    let code = refresh_url(&page)
+        .query_pairs()
+        .find(|(name, _)| name == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let tokens = server.exchange(&code, &pkce.verifier, "Mac").await;
+    assert_eq!(tokens.status(), 200);
+
+    // A passkey for an account it doesn't belong to is refused.
+    let other = unique_email("other");
+    let mut stranger = server.add_passkey(&other).await;
+    stranger.user = passkey.user.clone();
+    let browser = common::browser();
+    browser
+        .get(server.authorize_url(&pkce, "s"))
+        .send()
+        .await
+        .unwrap();
+    let options: Value = browser
+        .post(format!("{}/authorize/passkey/login", server.url))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let refused = browser
+        .post(format!("{}/authorize/passkey/login/finish", server.url))
+        .json(&stranger.get(&options, &server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+}
+
+#[tokio::test]
+async fn a_new_passkey_is_asked_to_be_discoverable() {
+    let server = start().await;
+    let browser = browser();
+    server
+        .enter_code(&browser, &unique_email("resident"), &pkce())
+        .await;
+    let options: Value = browser
+        .post(format!("{}/authorize/passkey/register", server.url))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let selection = &options["publicKey"]["authenticatorSelection"];
+    assert_eq!(selection["residentKey"], "required", "{options}");
+    assert_eq!(selection["requireResidentKey"], true);
+}
+
+#[tokio::test]
 async fn the_code_page_says_when_it_expires_and_sends_one_new_code() {
     let server = start().await;
     let email = unique_email("resend");
