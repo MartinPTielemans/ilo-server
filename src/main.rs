@@ -19,18 +19,21 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("can't listen on {}:{}", address.0, address.1))?;
     let state = ilo_server::state(config, mailer).await?;
     tracing::info!(address = %listener.local_addr()?, issuer = state.config.issuer(), "ilo-server is up");
-    axum::serve(listener, ilo_server::router(state))
-        .with_graceful_shutdown(async {
-            let interrupt = tokio::signal::ctrl_c();
-            #[cfg(unix)]
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("can't watch for SIGTERM");
-            #[cfg(unix)]
-            tokio::select! { _ = interrupt => {}, _ = terminate.recv() => {} }
-            #[cfg(not(unix))]
-            let _ = interrupt.await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        ilo_server::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let interrupt = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("can't watch for SIGTERM");
+        #[cfg(unix)]
+        tokio::select! { _ = interrupt => {}, _ = terminate.recv() => {} }
+        #[cfg(not(unix))]
+        let _ = interrupt.await;
+    })
+    .await?;
     Ok(())
 }
