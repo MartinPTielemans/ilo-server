@@ -217,6 +217,91 @@ async fn deleting_a_folder_deletes_what_it_holds() {
 }
 
 #[tokio::test]
+async fn only_ciphertext_is_kept_for_the_types_a_passphrase_encrypts() {
+    const PASSWORDS: i32 = 45873;
+    const DEVICE_INFO: i32 = 154522;
+    let server = start().await;
+    let email = unique_email("plaintext");
+    let mut mac = server.device(&email, "Mac").await;
+    let tagged = |tag: &str, specifics: Vec<u8>| SyncEntity {
+        id_string: Some(format!("client-{tag}")),
+        version: Some(0),
+        client_tag_hash: Some(tag.into()),
+        specifics: Some(specifics),
+        ..Default::default()
+    };
+    let password = |inner: &[u8]| {
+        let mut bytes = Vec::new();
+        prost::encoding::bytes::encode(PASSWORDS as u32, &inner.to_vec(), &mut bytes);
+        bytes
+    };
+    // A preference whose value is in the clear, as a client without the passphrase sends it.
+    let mut plain_preference = Vec::new();
+    prost::encoding::bytes::encode(
+        PREFERENCES as u32,
+        &b"\x0a\x05theme".to_vec(),
+        &mut plain_preference,
+    );
+
+    let results = mac
+        .commit(vec![
+            tagged("plain-preference", plain_preference),
+            // `unencrypted_metadata`, which names the site.
+            tagged("plain-password", password(b"\x1a\x03url")),
+            // Encrypted, but named for its site.
+            SyncEntity {
+                name: Some("https://example.org/".into()),
+                ..tagged("named-password", password(b"\x0a\x01\x09\x2a\x01\x09"))
+            },
+            tagged("preference", encrypted_specifics(PREFERENCES, b"dark")),
+            // `encrypted`, then `encrypted_notes_backup`, named as Chromium names it.
+            SyncEntity {
+                name: Some("encrypted".into()),
+                ..tagged("password", password(b"\x0a\x01\x09\x2a\x01\x09"))
+            },
+            // Chromium never encrypts its device records.
+            tagged("device", ilo_server::sync::empty_specifics(DEVICE_INFO)),
+        ])
+        .await
+        .commit
+        .unwrap()
+        .entryresponse;
+    let kinds: Vec<_> = results
+        .iter()
+        .map(|result| result.response_type())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ResponseType::InvalidMessage,
+            ResponseType::InvalidMessage,
+            ResponseType::InvalidMessage,
+            ResponseType::Success,
+            ResponseType::Success,
+            ResponseType::Success,
+        ]
+    );
+
+    let seen = mac
+        .get_updates(vec![
+            marker(PREFERENCES, None),
+            marker(PASSWORDS, None),
+            marker(DEVICE_INFO, None),
+        ])
+        .await
+        .get_updates
+        .unwrap()
+        .entries;
+    let mut tags: Vec<_> = seen.iter().map(|entity| entity.client_tag_hash()).collect();
+    tags.sort();
+    assert_eq!(
+        tags,
+        ["device", "password", "preference"],
+        "nothing in the clear was kept"
+    );
+}
+
+#[tokio::test]
 async fn clearing_the_server_data_starts_every_device_over() {
     let server = start().await;
     let email = unique_email("clear");

@@ -24,7 +24,8 @@ Chromium's sync protocol, unchanged: `POST /command/` with a `ClientToServerMess
 
 - A body may be gzipped (`Content-Encoding: gzip`), as Chromium's engine always sends it. The answer is gzipped when `Accept-Encoding` offers it. A body over 32 MiB, after inflating, gets `413`.
 - `ClearServerData` gives the account a new store birthday, and a client with the old one gets `NOT_MY_BIRTHDAY` and starts over.
-- The server reads only an entity's data type, the top-level field number of its specifics. It stores the specifics as they come.
+- The server reads only the field numbers of an entity's specifics: the top-level one that names its data type, whether `encrypted` (field 1) is set, and, for passwords, which fields their own message holds. It stores the specifics as they come.
+- An item of a type Chromium encrypts under a passphrase must arrive as Chromium sends it then: `encrypted` and the type's field, empty, or for passwords only their `encrypted` and `encrypted_notes_backup`, and with no name but `encrypted`, which Chromium gives every item it encrypts. Anything else is answered `INVALID_MESSAGE` and not kept. The types Chromium never encrypts (`kNeverEncrypted` at the pin), such as Nigori and device records, and deletions are exempt.
 
 A client turns on a custom passphrase, the account secret below, before its first commit. Chromium then encrypts every item's specifics with keys derived from it, and stops syncing the types it won't sync under a passphrase.
 
