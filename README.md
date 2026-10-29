@@ -25,12 +25,12 @@ Sign-in codes and tokens are stored only as hashes.
 
 ## Self-hosting
 
-You need a domain with HTTPS in front of the server, which passkeys require, and an SMTP account to send sign-in codes.
+You need a domain with HTTPS in front of the server, which passkeys require, and a way to send sign-in codes: an SMTP account, or Cloudflare Email Service's send API where the host blocks outbound SMTP, as Railway does below its Pro plan.
 
 **With Docker Compose** (the server and Postgres):
 
 1. `git clone https://github.com/MartinPTielemans/ilo-server && cd ilo-server`
-2. `cp .env.example .env`. Set `POSTGRES_PASSWORD` to a long random string, `PUBLIC_URL` to your address, such as `https://sync.example.org`, and `SMTP_URL` and `MAIL_FROM` to your mail account.
+2. `cp .env.example .env`. Set `POSTGRES_PASSWORD` to a long random string, `PUBLIC_URL` to your address, such as `https://sync.example.org`, and `SMTP_URL` and `MAIL_FROM` to your mail account, or `MAIL_API=cloudflare` and its two settings in place of `SMTP_URL`.
 3. `docker compose up -d`
 4. Point your HTTPS proxy at port 8080, and check that `https://sync.example.org/health` says `ok`.
 5. In ilo, set the account server to your address, and sign in.
@@ -50,7 +50,7 @@ docker run -d --name ilo-server -p 8080:8080 -v ilo-data:/data \
 
 Back up the database: it holds accounts, the key that signs ID tokens, and the encrypted sync data.
 
-**On Railway**, a service made from this repo builds its Dockerfile, and Railway gives it `PORT` and `RAILWAY_PUBLIC_DOMAIN`, which `PUBLIC_URL` defaults to. Add a Postgres database and set the service's `DATABASE_URL` to the database's, set `SMTP_URL` and `MAIL_FROM`, and Railway reads the `/health` health check and the one replica from [`railway.json`](railway.json). [`.railway/railway.ts`](.railway/railway.ts) describes the same for `railway config apply`; it hasn't been tried yet.
+**On Railway**, a service made from this repo builds its Dockerfile, and Railway gives it `PORT` and `RAILWAY_PUBLIC_DOMAIN`, which `PUBLIC_URL` defaults to. Add a Postgres database and set the service's `DATABASE_URL` to the database's, set `MAIL_API=cloudflare`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` and `MAIL_FROM`, since Railway blocks outbound SMTP on its Free, Trial and Hobby plans, and Railway reads the `/health` health check and the one replica from [`railway.json`](railway.json). [`.railway/railway.ts`](.railway/railway.ts) describes the same for `railway config apply`; it hasn't been tried yet.
 
 ### Proxies
 
@@ -64,8 +64,10 @@ Run one instance. The relay keeps connections in its process.
 |---|---|---|
 | `PUBLIC_URL` | `https://$RAILWAY_PUBLIC_DOMAIN`, else `http://localhost:$PORT` | The address clients use: the OIDC issuer and the passkeys' origin. Must be https unless it's localhost or `DEV_MODE` is on. |
 | `DATABASE_URL` | `sqlite:ilo-server.db?mode=rwc` (the image: `/data/ilo-server.db`) | `sqlite:…` or `postgres://…`. Migrations run at start. |
-| `SMTP_URL` | | Where codes are mailed from, as `smtps://user:password@host:465` or `smtp://user:password@host:587?tls=required`. Required unless `DEV_MODE`. |
-| `MAIL_FROM` | | The codes' sender, such as `ilo <sync@example.org>`. |
+| `SMTP_URL` | | Where codes are mailed from, as `smtps://user:password@host:465` or `smtp://user:password@host:587?tls=required`. This or `MAIL_API` is required unless `DEV_MODE`, and not both. |
+| `MAIL_API` | | `cloudflare` sends codes through [Cloudflare Email Service's send API](https://developers.cloudflare.com/email-service/api/send-emails/rest-api/) over HTTPS instead of SMTP, for hosts that block outbound SMTP. |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | | With `MAIL_API=cloudflare`: the account that sends, and an API token with Email Sending: Edit. |
+| `MAIL_FROM` | | The codes' sender, such as `ilo <sync@example.org>`, on a domain the mail account or Email Service sends for. Required with either. |
 | `DEV_MODE` | off | `1` logs sign-in codes instead of mailing them and allows plain http. Never for real users. |
 | `OIDC_REDIRECT_URIS` | | More redirect URIs to allow, comma-separated, besides loopback addresses and `$PUBLIC_URL/signed-in`. |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | Where it listens. |

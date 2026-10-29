@@ -42,6 +42,14 @@ impl Drop for Server {
 /// Each test gets a fresh SQLite file, or shares the Postgres in
 /// `ILO_TEST_DATABASE_URL` with addresses no other test uses.
 pub async fn start() -> Server {
+    let (mailer, mail) = Mailer::recording();
+    let mut server = start_with(mailer).await;
+    server.mail = mail;
+    server
+}
+
+/// A server that sends its mail with `mailer`, which `Server::mail` doesn't see.
+pub async fn start_with(mailer: Mailer) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (database_url, database) = match std::env::var("ILO_TEST_DATABASE_URL") {
@@ -62,7 +70,6 @@ pub async fn start() -> Server {
         _ => None,
     })
     .unwrap();
-    let (mailer, mail) = Mailer::recording();
     let state = ilo_server::state(config, mailer).await.unwrap();
     let db = state.db.clone();
     tokio::spawn(async move {
@@ -73,7 +80,7 @@ pub async fn start() -> Server {
     Server {
         url: format!("http://localhost:{port}"),
         db,
-        mail,
+        mail: Arc::default(),
         database,
     }
 }

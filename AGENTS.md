@@ -23,7 +23,7 @@ Ambitious ideas, simple systems, software that feels obvious. Do not preserve co
 ## The ways to hurt yourself
 
 1. **Deploying, or touching the hosted copy.** The Railway service holds real users' accounts and data. Changes reach it only through a merged PR. Never run `railway` commands, apply `.railway/railway.ts`, or connect to its database without the owner's go-ahead.
-2. **Mailing real people.** Without `DEV_MODE`, sign-in sends mail through `SMTP_URL`. Run the server with `DEV_MODE=1` and no SMTP settings, and the codes go to the log. Tests use a recording mailer and `@example.org` addresses.
+2. **Mailing real people.** Without `DEV_MODE`, sign-in sends mail through `SMTP_URL` or `MAIL_API`. Run the server with `DEV_MODE=1` and neither, and the codes go to the log. Tests use a recording mailer and `@example.org` addresses.
 3. **Running the tests against a real database.** `ILO_TEST_DATABASE_URL` points the tests at a Postgres they write accounts into and never clean. Use a throwaway container only.
 4. **Editing the protos.** `proto/` is Chromium's, unmodified, from the engine's pin. To change what the server sees, change `build.rs`; to update them, follow `proto/README.md`.
 5. **Editing a migration that has shipped.** Databases that ran it won't run it again. Add a new numbered file instead, in both `migrations/sqlite` and `migrations/postgres`.
