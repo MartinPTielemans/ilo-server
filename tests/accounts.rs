@@ -108,6 +108,45 @@ async fn verified_claims(server: &Server, id_token: &str) -> Value {
 }
 
 #[tokio::test]
+async fn a_send_api_that_fails_gets_the_page_an_smtp_failure_does() {
+    use axum::http::StatusCode;
+    let tried = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = tried.clone();
+    let api = axum::Router::new().route(
+        "/accounts/{account}/email/sending/send",
+        axum::routing::post(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { (StatusCode::INTERNAL_SERVER_ERROR, "{\"success\":false}") }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let from = "ilo <sign-in@example.org>".parse().unwrap();
+    let mailer = ilo_server::mail::Mailer::cloudflare(&api_url, "account", "token", from).unwrap();
+    let server = start_with(mailer).await;
+    let browser = browser();
+    browser
+        .get(server.authorize_url(&pkce(), "s"))
+        .send()
+        .await
+        .unwrap();
+    let page = browser
+        .post(format!("{}/authorize/email", server.url))
+        .form(&[("email", unique_email("api"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tried.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        page.text()
+            .await
+            .unwrap()
+            .contains("The server couldn&#39;t send mail.")
+    );
+}
+
+#[tokio::test]
 async fn a_wrong_code_is_refused_and_counts_against_the_limit() {
     let server = start().await;
     let email = unique_email("wrong");

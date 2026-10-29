@@ -42,17 +42,28 @@ impl Drop for Server {
 /// Each test gets a fresh SQLite file, or shares the Postgres in
 /// `ILO_TEST_DATABASE_URL` with addresses no other test uses.
 pub async fn start() -> Server {
-    start_with(&[], true).await
+    let (mailer, mail) = Mailer::recording();
+    let mut server = serve(mailer, &[], true).await;
+    server.mail = mail;
+    server
+}
+
+/// A server that sends its mail with `mailer`, which `Server::mail` doesn't see.
+pub async fn start_with(mailer: Mailer) -> Server {
+    serve(mailer, &[], true).await
 }
 
 /// A server on a fresh SQLite file, even when the tests share a Postgres, with
 /// `vars` over the tests' settings: for limits that count every sign-in on the
 /// server. Clients name their address in X-Real-IP.
 pub async fn start_alone(vars: &[(&str, &str)]) -> Server {
-    start_with(vars, false).await
+    let (mailer, mail) = Mailer::recording();
+    let mut server = serve(mailer, vars, false).await;
+    server.mail = mail;
+    server
 }
 
-async fn start_with(vars: &[(&str, &str)], shared: bool) -> Server {
+async fn serve(mailer: Mailer, vars: &[(&str, &str)], shared: bool) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let shared = std::env::var("ILO_TEST_DATABASE_URL")
@@ -81,7 +92,6 @@ async fn start_with(vars: &[(&str, &str)], shared: bool) -> Server {
         _ => None,
     })
     .unwrap();
-    let (mailer, mail) = Mailer::recording();
     let state = ilo_server::state(config, mailer).await.unwrap();
     let db = state.db.clone();
     tokio::spawn(async move {
@@ -95,7 +105,7 @@ async fn start_with(vars: &[(&str, &str)], shared: bool) -> Server {
     Server {
         url: format!("http://localhost:{port}"),
         db,
-        mail,
+        mail: Arc::default(),
         database,
     }
 }

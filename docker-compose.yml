@@ -14,7 +14,11 @@ services:
       CLIENT_IP_HEADER: ${CLIENT_IP_HEADER:-}
       CODES_PER_CLIENT_PER_HOUR: ${CODES_PER_CLIENT_PER_HOUR:-}
       CODES_PER_DAY: ${CODES_PER_DAY:-}
+      # SMTP_URL, or MAIL_API and its two settings: .env.example says which.
       SMTP_URL: ${SMTP_URL:-}
+      MAIL_API: ${MAIL_API:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       MAIL_FROM: ${MAIL_FROM:-}
     depends_on:
       db:

@@ -12,7 +12,8 @@ pub struct Config {
     pub public_url: Url,
     /// Sign-in codes go to the log instead of by mail, and plain http is allowed.
     pub dev_mode: bool,
-    pub smtp_url: Option<String>,
+    /// How mail goes out: none in dev mode, where codes go to the log.
+    pub mail: Option<Transport>,
     pub mail_from: Option<String>,
     /// Redirect URIs allowed besides loopback addresses and `/signed-in`.
     pub redirect_uris: Vec<String>,
@@ -23,6 +24,28 @@ pub struct Config {
     pub codes_per_client_per_hour: i64,
     /// Codes the server mails in a day, under the mail account's quota.
     pub codes_per_day: i64,
+}
+
+/// One way to send mail, which the server sets up at start.
+#[derive(Clone)]
+pub enum Transport {
+    /// `SMTP_URL`, for self-hosters' mail accounts.
+    Smtp(String),
+    /// Cloudflare Email Service's send API, over HTTPS, for hosts that block outbound SMTP, as
+    /// Railway does below its Pro plan.
+    Cloudflare { account_id: String, token: String },
+}
+
+// The URL and the token hold passwords.
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Smtp(_) => f.write_str("Smtp(..)"),
+            Self::Cloudflare { account_id, .. } => {
+                write!(f, "Cloudflare {{ account_id: {account_id:?}, .. }}")
+            }
+        }
+    }
 }
 
 impl Config {
@@ -54,13 +77,24 @@ impl Config {
         if public_url.scheme() != "https" && !dev_mode && !local {
             bail!("PUBLIC_URL must be https outside DEV_MODE");
         }
-        let smtp_url = var("SMTP_URL");
-        if smtp_url.is_none() && !dev_mode {
-            bail!("SMTP_URL is needed to send sign-in codes; set DEV_MODE=1 to log them instead");
-        }
+        let mail = match (var("SMTP_URL"), var("MAIL_API")) {
+            (Some(_), Some(_)) => bail!("set SMTP_URL or MAIL_API, not both"),
+            (Some(url), None) => Some(Transport::Smtp(url)),
+            (None, Some(api)) if api == "cloudflare" => Some(Transport::Cloudflare {
+                account_id: var("CLOUDFLARE_ACCOUNT_ID")
+                    .context("CLOUDFLARE_ACCOUNT_ID is needed with MAIL_API=cloudflare")?,
+                token: var("CLOUDFLARE_API_TOKEN")
+                    .context("CLOUDFLARE_API_TOKEN is needed with MAIL_API=cloudflare")?,
+            }),
+            (None, Some(api)) => bail!("MAIL_API is {api:?}; the one it knows is cloudflare"),
+            (None, None) if dev_mode => None,
+            (None, None) => bail!(
+                "SMTP_URL or MAIL_API is needed to send sign-in codes; set DEV_MODE=1 to log them instead"
+            ),
+        };
         let mail_from = var("MAIL_FROM");
-        if smtp_url.is_some() && mail_from.is_none() {
-            bail!("MAIL_FROM is needed with SMTP_URL");
+        if mail.is_some() && mail_from.is_none() {
+            bail!("MAIL_FROM is needed to send mail");
         }
         // Railway's edge puts the client's address in X-Real-IP.
         let client_ip_header = match (var("CLIENT_IP_HEADER"), var("RAILWAY_PUBLIC_DOMAIN")) {
@@ -93,7 +127,7 @@ impl Config {
                 .unwrap_or_else(|| "sqlite:ilo-server.db?mode=rwc".into()),
             public_url,
             dev_mode,
-            smtp_url,
+            mail,
             mail_from,
             redirect_uris: var("OIDC_REDIRECT_URIS")
                 .map(|uris| uris.split(',').map(|uri| uri.trim().to_owned()).collect())
@@ -135,13 +169,72 @@ mod tests {
     fn dev_mode_needs_nothing_else() {
         let config = config(&[("DEV_MODE", "1")]).unwrap();
         assert_eq!(config.issuer(), "http://localhost:8080");
-        assert!(config.smtp_url.is_none());
+        assert!(config.mail.is_none());
     }
 
     #[test]
     fn production_needs_a_mailer() {
         let error = config(&[("PUBLIC_URL", "https://sync.example.org")]).unwrap_err();
-        assert!(error.to_string().contains("SMTP_URL"));
+        assert!(error.to_string().contains("SMTP_URL or MAIL_API"));
+    }
+
+    const PRODUCTION: [(&str, &str); 2] = [
+        ("PUBLIC_URL", "https://sync.example.org"),
+        ("MAIL_FROM", "ilo <sync@example.org>"),
+    ];
+
+    fn production(vars: &[(&str, &str)]) -> anyhow::Result<Config> {
+        config(&[&PRODUCTION[..], vars].concat())
+    }
+
+    #[test]
+    fn cloudflare_api_is_a_mailer() {
+        let config = production(&[
+            ("MAIL_API", "cloudflare"),
+            ("CLOUDFLARE_ACCOUNT_ID", "account"),
+            ("CLOUDFLARE_API_TOKEN", "secret-token"),
+        ])
+        .unwrap();
+        assert!(matches!(
+            &config.mail,
+            Some(Transport::Cloudflare { account_id, token })
+                if account_id == "account" && token == "secret-token"
+        ));
+        assert!(!format!("{config:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn cloudflare_api_needs_its_account_and_token() {
+        let error =
+            production(&[("MAIL_API", "cloudflare"), ("CLOUDFLARE_API_TOKEN", "t")]).unwrap_err();
+        assert!(error.to_string().contains("CLOUDFLARE_ACCOUNT_ID"));
+        let error =
+            production(&[("MAIL_API", "cloudflare"), ("CLOUDFLARE_ACCOUNT_ID", "a")]).unwrap_err();
+        assert!(error.to_string().contains("CLOUDFLARE_API_TOKEN"));
+    }
+
+    #[test]
+    fn one_mailer_only() {
+        let error = production(&[
+            ("SMTP_URL", "smtps://mail.example.org"),
+            ("MAIL_API", "cloudflare"),
+            ("CLOUDFLARE_ACCOUNT_ID", "a"),
+            ("CLOUDFLARE_API_TOKEN", "t"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("not both"));
+        let error = production(&[("MAIL_API", "resend")]).unwrap_err();
+        assert!(error.to_string().contains("cloudflare"));
+    }
+
+    #[test]
+    fn a_mailer_needs_a_sender() {
+        let error = config(&[
+            ("PUBLIC_URL", "https://sync.example.org"),
+            ("SMTP_URL", "smtps://mail.example.org"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("MAIL_FROM"));
     }
 
     #[test]
