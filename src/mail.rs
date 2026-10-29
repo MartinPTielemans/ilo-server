@@ -10,13 +10,16 @@ use crate::config::Config;
 
 #[derive(Clone)]
 pub enum Mailer {
-    Smtp {
-        transport: AsyncSmtpTransport<Tokio1Executor>,
-        from: Mailbox,
-    },
+    Smtp(Box<Smtp>),
     Log,
     /// Keeps what it's given, for tests.
     Recording(Arc<Mutex<Vec<Mail>>>),
+}
+
+#[derive(Clone)]
+pub struct Smtp {
+    transport: AsyncSmtpTransport<Tokio1Executor>,
+    from: Mailbox,
 }
 
 #[derive(Clone, Debug)]
@@ -28,12 +31,12 @@ pub struct Mail {
 impl Mailer {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         match (&config.smtp_url, &config.mail_from) {
-            (Some(url), Some(from)) => Ok(Self::Smtp {
+            (Some(url), Some(from)) => Ok(Self::Smtp(Box::new(Smtp {
                 transport: AsyncSmtpTransport::<Tokio1Executor>::from_url(url)
                     .context("SMTP_URL is not an SMTP URL")?
                     .build(),
                 from: from.parse().context("MAIL_FROM is not an address")?,
-            }),
+            }))),
             _ => Ok(Self::Log),
         }
     }
@@ -45,9 +48,9 @@ impl Mailer {
 
     pub async fn send_code(&self, to: &str, code: &str) -> anyhow::Result<()> {
         match self {
-            Self::Smtp { transport, from } => {
+            Self::Smtp(smtp) => {
                 let message = Message::builder()
-                    .from(from.clone())
+                    .from(smtp.from.clone())
                     .to(to.parse().context("not an email address")?)
                     .subject(format!("{code} is your ilo sign-in code"))
                     .body(format!(
@@ -55,7 +58,7 @@ impl Mailer {
                          It works for 10 minutes. If you didn't try to sign in, \
                          you can ignore this mail.\n"
                     ))?;
-                transport
+                smtp.transport
                     .send(message)
                     .await
                     .context("the SMTP server refused the mail")?;

@@ -1,5 +1,8 @@
 //! ilo's account, sync and relay server.
 
+// Handlers return a ready response as their error; boxing it would buy nothing.
+#![allow(clippy::result_large_err)]
+
 pub mod accounts;
 pub mod config;
 pub mod db;

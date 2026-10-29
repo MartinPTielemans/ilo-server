@@ -251,10 +251,10 @@ pub async fn email(
         .bind(&sign_in.id)
         .execute(&state.db)
         .await?;
-        if let Some(account) = super::find_by_email(&state.db, &email).await? {
-            if !super::passkeys(&state.db, &account).await?.is_empty() {
-                return Ok(pages::choose(&email));
-            }
+        if let Some(account) = super::find_by_email(&state.db, &email).await?
+            && !super::passkeys(&state.db, &account).await?.is_empty()
+        {
+            return Ok(pages::choose(&email));
         }
         send_code(&state, &email).await
     }
