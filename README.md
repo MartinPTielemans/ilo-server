@@ -48,7 +48,7 @@ docker run -d --name ilo-server -p 8080:8080 -v ilo-data:/data \
 
 Back up the database: it holds accounts, the key that signs ID tokens, and the encrypted sync data.
 
-**On Railway**, a service made from this repo builds its Dockerfile, and Railway gives it `PORT` and `RAILWAY_PUBLIC_DOMAIN`, which `PUBLIC_URL` defaults to. Add a Postgres database and set the service's `DATABASE_URL` to the database's, set `SMTP_URL` and `MAIL_FROM`, use `/health` as its health check, and keep it at one replica. [`.railway/railway.ts`](.railway/railway.ts) describes the same for `railway config apply`; it hasn't been tried yet.
+**On Railway**, a service made from this repo builds its Dockerfile, and Railway gives it `PORT` and `RAILWAY_PUBLIC_DOMAIN`, which `PUBLIC_URL` defaults to. Add a Postgres database and set the service's `DATABASE_URL` to the database's, set `SMTP_URL` and `MAIL_FROM`, and Railway reads the `/health` health check and the one replica from [`railway.json`](railway.json). [`.railway/railway.ts`](.railway/railway.ts) describes the same for `railway config apply`; it hasn't been tried yet.
 
 ### Proxies
 

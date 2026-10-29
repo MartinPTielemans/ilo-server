@@ -12,8 +12,8 @@ RUN apt-get update \
     && mkdir /data && chown ilo /data
 COPY --from=build /ilo-server /usr/local/bin/ilo-server
 USER ilo
-# SQLite in the volume unless DATABASE_URL names a Postgres.
+# SQLite in /data unless DATABASE_URL names a Postgres. No VOLUME, which Railway refuses: mount one
+# there, as `docker run -v` does, or the database goes with the container.
 ENV DATABASE_URL=sqlite:/data/ilo-server.db?mode=rwc PORT=8080
-VOLUME /data
 EXPOSE 8080
 CMD ["ilo-server"]
