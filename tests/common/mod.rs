@@ -93,6 +93,15 @@ pub fn browser() -> reqwest::Client {
         .unwrap()
 }
 
+/// Where a page's `<meta http-equiv="refresh">` sends the tab.
+pub fn refresh_url(html: &str) -> url::Url {
+    let (_, rest) = html
+        .split_once(r#"http-equiv="refresh" content="1; url="#)
+        .expect("the page redirects");
+    let (url, _) = rest.split_once('"').unwrap();
+    url::Url::parse(&url.replace("&amp;", "&")).unwrap()
+}
+
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
@@ -132,9 +141,14 @@ impl Server {
         url.into()
     }
 
-    /// Runs the sign-in pages to the redirect, and returns its authorization code.
-    pub async fn authorization_code(&self, email: &str, pkce: &Pkce) -> String {
-        let browser = browser();
+    /// Opens the sign-in pages in `browser`, enters `email`, and sends the
+    /// mailed code: the answer is the passkey offer or the way to the done page.
+    pub async fn enter_code(
+        &self,
+        browser: &reqwest::Client,
+        email: &str,
+        pkce: &Pkce,
+    ) -> reqwest::Response {
         let page = browser
             .get(self.authorize_url(pkce, "state-1"))
             .send()
@@ -149,25 +163,47 @@ impl Server {
             .unwrap();
         assert!(page.text().await.unwrap().contains("Check your email"));
         let code = self.last_code(email);
-        let page = browser
+        browser
             .post(format!("{}/authorize/code", self.url))
             .form(&[("code", code)])
             .send()
             .await
-            .unwrap();
-        assert!(page.text().await.unwrap().contains("Add a passkey"));
-        let redirect = browser
-            .post(format!("{}/authorize/continue", self.url))
+            .unwrap()
+    }
+
+    /// Follows a finished sign-in to the done page, and returns the
+    /// authorization code in the redirect it sends the tab on to.
+    pub async fn done(&self, browser: &reqwest::Client, finished: reqwest::Response) -> String {
+        assert_eq!(finished.status(), 303);
+        assert_eq!(finished.headers()["location"], "/authorize/done");
+        let page = browser
+            .get(format!("{}/authorize/done", self.url))
             .send()
             .await
             .unwrap();
-        assert_eq!(redirect.status(), 303);
-        let location = url::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
+        assert_eq!(page.status(), 200);
+        let location = refresh_url(&page.text().await.unwrap());
         assert!(location.as_str().starts_with(REDIRECT));
         let query: std::collections::HashMap<_, _> = location.query_pairs().into_owned().collect();
         assert_eq!(query["state"], "state-1");
         assert_eq!(query["iss"], self.url);
         query["code"].clone()
+    }
+
+    /// Runs the sign-in pages to the redirect, saying "Not now" to a passkey,
+    /// and returns the authorization code.
+    pub async fn authorization_code(&self, email: &str, pkce: &Pkce) -> String {
+        let browser = browser();
+        let mut answer = self.enter_code(&browser, email, pkce).await;
+        if answer.status() == 200 {
+            assert!(answer.text().await.unwrap().contains("Add a passkey"));
+            answer = browser
+                .post(format!("{}/authorize/continue", self.url))
+                .send()
+                .await
+                .unwrap();
+        }
+        self.done(&browser, answer).await
     }
 
     pub async fn exchange(

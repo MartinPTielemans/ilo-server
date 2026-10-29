@@ -39,7 +39,7 @@ The most common defect is a change that works on the path you tested and is miss
 - **ilo's client.** The relay's frames (documented at the top of `src/relay.rs`), the OIDC endpoints and `/api/` are what ilo's core builds on. A change to them is a change to its contract; say so in the PR.
 - **Self-hosters.** A new setting is an environment variable, read in `src/config.rs`, with its default and its row in the README's table, and in `docker-compose.yml` and `.env.example` when a self-hoster sets it.
 - **Railway.** `.railway/railway.ts` follows a change in how the service runs: healthcheck, replicas, database.
-- **Sign-in pages.** They run in an ilo tab: light and dark, keyboard only, and screen readers (the alerts use `role="alert"`).
+- **Sign-in pages.** They run in an ilo tab: light and dark, keyboard only, and screen readers (the alerts use `role="alert"`). Their look is the browser's tokens (`app/design/tokens.toml` there), and their CSP allows nothing inline, so style goes in `sign-in.css` and script in `sign-in.js`.
 - **Reverse states.** If you added a way in, add the way out and the way to see it. A one-way door is a bug. A device is listed and removable, an account deletable, a token revocable, and synced data clearable.
 
 ## Dev

@@ -73,6 +73,7 @@ pub fn router(state: Shared) -> Router {
         .route("/authorize/send-code", post(sign_in::send_code_again))
         .route("/authorize/code", post(sign_in::code))
         .route("/authorize/continue", post(sign_in::skip_passkey))
+        .route("/authorize/done", get(sign_in::done))
         .route("/authorize/passkey/register", post(sign_in::register_start))
         .route(
             "/authorize/passkey/register/finish",
@@ -84,6 +85,7 @@ pub fn router(state: Shared) -> Router {
             post(sign_in::login_finish),
         )
         .route("/sign-in.js", get(accounts::pages_script))
+        .route("/sign-in.css", get(accounts::pages_style))
         .route("/signed-in", get(sign_in::signed_in))
         .route("/token", post(oidc::token))
         .route("/userinfo", get(oidc::userinfo).post(oidc::userinfo))

@@ -58,6 +58,11 @@ async function login() {
 }
 
 for (const button of document.querySelectorAll("[data-passkey]")) {
+  // Without WebAuthn, the page's other way on is the only one.
+  if (!window.PublicKeyCredential) {
+    button.hidden = true;
+    continue;
+  }
   button.addEventListener("click", async () => {
     const error = document.getElementById("passkey-error");
     error.hidden = true;

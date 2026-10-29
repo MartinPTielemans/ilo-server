@@ -4,7 +4,7 @@
 pub mod devices;
 pub mod oidc;
 mod pages;
-pub use pages::script as pages_script;
+pub use pages::{script as pages_script, style as pages_style};
 pub mod sign_in;
 
 use webauthn_rs::prelude::{Passkey, Uuid};
