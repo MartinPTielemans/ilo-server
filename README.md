@@ -4,7 +4,7 @@ Accounts, end-to-end encrypted sync, and a relay between devices for [ilo](https
 
 - **Accounts.** Sign in with a code sent by email, then with a passkey. The server is an OpenID Connect provider, so ilo signs in through a page in a tab.
 - **Sync.** `/command/` speaks Chromium's own sync protocol, so ilo's unmodified sync engine syncs bookmarks, passwords, history, tabs, extensions and settings here. ilo encrypts them with a passphrase the server never sees; the server stores ciphertext.
-- **Relay.** Each device keeps one WebSocket. When one device commits, the others hear within a second instead of polling, and devices pass each other encrypted messages, such as approving a new device.
+- **Relay.** Each device keeps one WebSocket. When one device commits, the others hear within a second instead of polling, and devices pass each other encrypted messages. A new device gets the passphrase from another through it, once the user sees the same match code on both.
 
 One binary, configured by environment variables, on SQLite or Postgres.
 
@@ -16,7 +16,7 @@ ilo turns on a custom passphrase before it first syncs, so Chromium encrypts eac
 - **Devices:** the name each sends at sign-in, and when it signed in and was last seen. Chromium also keeps its device records unencrypted: each device's name, operating system and form factor, browser version, and when it was last active.
 - **A few settings:** Chromium's priority preferences, a small set it keeps unencrypted.
 - **Everything else, in outline:** which data types an account syncs, how many items each has, their sizes, when they're created and changed, and how bookmarks nest and are ordered. Not their names, addresses or contents.
-- **The relay:** which of an account's devices message each other, when, and how large the messages are. Not what they say.
+- **The relay:** which of an account's devices message each other, when, and how large the messages are. Not what they say. Adding a device also shows the name and operating system it gives, and keys and a sealed passphrase that the server can't open.
 - **The network:** like any web server, the addresses requests come from and when. This server doesn't log them, but a proxy in front of it may.
 
 Sign-in codes and tokens are stored only as hashes.
@@ -78,7 +78,7 @@ Run one instance. The relay keeps connections in its process.
 | `POST /token` | `authorization_code` (takes an optional `device_name`) and `refresh_token`. Each code exchange makes a device. Refresh tokens rotate. |
 | `GET /userinfo`, `GET /jwks`, `POST /revoke` | Revoking a refresh token signs its device out. |
 | `POST /command/` | Chromium sync: GetUpdates, Commit, ClearServerData. Bearer access token. |
-| `GET /relay` | The device's WebSocket. Bearer access token. Frames are described in [`src/relay.rs`](src/relay.rs). |
+| `GET /relay` | The device's WebSocket, which also carries pairing. Bearer access token. |
 | `GET /api/devices`, `DELETE /api/devices/{id}`, `DELETE /api/account` | The account's devices, removing one, and deleting the account with all its data. |
 | `GET /health` | `ok` while the database answers. |
 
@@ -89,7 +89,7 @@ DEV_MODE=1 cargo run       # serves on localhost:8080
 cargo test                 # on SQLite; ILO_TEST_DATABASE_URL=postgres://… for Postgres
 ```
 
-[AGENTS.md](AGENTS.md) holds the project's rules and traps, and [CONTRIBUTING.md](CONTRIBUTING.md) how to send a change.
+[docs/protocol.md](docs/protocol.md) is the contract with clients: sign-in, sync, the relay's frames and pairing. [AGENTS.md](AGENTS.md) holds the project's rules and traps, and [CONTRIBUTING.md](CONTRIBUTING.md) how to send a change.
 
 ## Licence
 

@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 mod jwt;
 pub mod mail;
+pub mod pairing;
 pub mod relay;
 pub mod sync;
 pub mod tokens;
