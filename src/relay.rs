@@ -2,13 +2,8 @@
 //! committed, in place of Google's push invalidations, and carries messages
 //! between an account's devices that the server can't read.
 //!
-//! Frames are JSON text:
-//! - server to device: `{"type":"hello","device":ID}` on connect,
-//!   `{"type":"changed","types":[32904]}` after another device's commit (an
-//!   empty list means everything), `{"type":"message","from":ID,"payload":P}`
-//!   and `{"type":"undelivered","to":ID,"id":X}`.
-//! - device to server: `{"type":"send","to":ID,"payload":P,"id":X}`, where
-//!   `P` is the sender's encrypted payload and `X` is optional.
+//! Its frames are JSON text, and `docs/protocol.md` lists them; pairing's
+//! steps are in `src/pairing.rs`.
 //!
 //! Connections live in this process, so the server runs as one instance.
 
@@ -28,6 +23,7 @@ use tokio::time::{Instant, interval_at};
 
 use crate::Shared;
 use crate::db;
+use crate::pairing;
 use crate::tokens::{Authenticated, Device};
 
 /// Under the 60 s that nginx and most load balancers allow an idle
@@ -106,13 +102,21 @@ impl Relay {
         }
     }
 
-    fn deliver(&self, from: &Device, to: &str, payload: &str) -> bool {
-        let message = json!({ "type": "message", "from": from.id, "payload": payload }).to_string();
+    /// Whether the frame is on its way to the account's device `to`.
+    pub fn send_to(&self, account: &str, to: &str, frame: String) -> bool {
         let accounts = self.accounts.lock().unwrap();
-        let peer = accounts
-            .get(&from.account_id)
-            .and_then(|peers| peers.get(to));
-        peer.is_some_and(|peer| peer.sender.try_send(Outgoing::Text(message)).is_ok())
+        let peer = accounts.get(account).and_then(|peers| peers.get(to));
+        peer.is_some_and(|peer| peer.sender.try_send(Outgoing::Text(frame)).is_ok())
+    }
+
+    /// To every connected device of the account but those in `except`.
+    pub fn broadcast(&self, account: &str, except: &[&str], frame: &str) {
+        let accounts = self.accounts.lock().unwrap();
+        for (device, peer) in accounts.get(account).into_iter().flatten() {
+            if !except.contains(&device.as_str()) {
+                let _ = peer.sender.try_send(Outgoing::Text(frame.to_owned()));
+            }
+        }
     }
 
     pub fn disconnect_device(&self, account: &str, device: &str) {
@@ -152,6 +156,26 @@ enum Incoming {
         payload: String,
         id: Option<serde_json::Value>,
     },
+    PairRequest {
+        commitment: String,
+        name: String,
+        os: String,
+    },
+    PairAccept {
+        pairing: String,
+        public_key: String,
+    },
+    PairReveal {
+        pairing: String,
+        public_key: String,
+    },
+    PairSeal {
+        pairing: String,
+        sealed: String,
+    },
+    PairCancel {
+        pairing: String,
+    },
 }
 
 async fn run(state: Shared, device: Device, socket: WebSocket) {
@@ -168,6 +192,14 @@ async fn run(state: Shared, device: Device, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let hello = json!({ "type": "hello", "device": device.id }).to_string();
     let mut alive = sink.send(Message::Text(hello.into())).await.is_ok();
+    match pairing::pending(&state, &device).await {
+        Ok(requests) => {
+            for request in requests {
+                alive = alive && sink.send(Message::Text(request.into())).await.is_ok();
+            }
+        }
+        Err(error) => tracing::warn!(%error, "can't read pending pairing requests"),
+    }
     let mut pings = interval_at(Instant::now() + PING_EVERY, PING_EVERY);
     let mut heard = Instant::now();
     while alive {
@@ -189,7 +221,7 @@ async fn run(state: Shared, device: Device, socket: WebSocket) {
                     heard = Instant::now();
                     match message {
                         Message::Text(text) => {
-                            if let Some(reply) = handle(&state, &device, &text) {
+                            if let Some(reply) = handle(&state, &device, &text).await {
                                 alive = sink.send(Message::Text(reply.into())).await.is_ok();
                             }
                         }
@@ -204,18 +236,47 @@ async fn run(state: Shared, device: Device, socket: WebSocket) {
     state.relay.unregister(&device, connection);
 }
 
-fn handle(state: &Shared, device: &Device, text: &str) -> Option<String> {
-    match serde_json::from_str::<Incoming>(text) {
-        Ok(Incoming::Send { to, payload, id }) => {
+async fn handle(state: &Shared, device: &Device, text: &str) -> Option<String> {
+    let Ok(incoming) = serde_json::from_str::<Incoming>(text) else {
+        return Some(json!({ "type": "error", "message": "unknown frame" }).to_string());
+    };
+    let replied = match incoming {
+        Incoming::Send { to, payload, id } => {
             if payload.len() > MAX_PAYLOAD {
                 return Some(
                     json!({ "type": "error", "message": "payload too large", "id": id })
                         .to_string(),
                 );
             }
-            (to == device.id || !state.relay.deliver(device, &to, &payload))
-                .then(|| json!({ "type": "undelivered", "to": to, "id": id }).to_string())
+            let message =
+                json!({ "type": "message", "from": device.id, "payload": payload }).to_string();
+            let sent = to != device.id && state.relay.send_to(&device.account_id, &to, message);
+            return (!sent)
+                .then(|| json!({ "type": "undelivered", "to": to, "id": id }).to_string());
         }
-        Err(_) => Some(json!({ "type": "error", "message": "unknown frame" }).to_string()),
+        Incoming::PairRequest {
+            commitment,
+            name,
+            os,
+        } => pairing::request(state, device, &commitment, &name, &os).await,
+        Incoming::PairAccept {
+            pairing,
+            public_key,
+        } => pairing::accept(state, device, &pairing, &public_key).await,
+        Incoming::PairReveal {
+            pairing,
+            public_key,
+        } => pairing::reveal(state, device, &pairing, &public_key).await,
+        Incoming::PairSeal { pairing, sealed } => {
+            pairing::seal(state, device, &pairing, &sealed).await
+        }
+        Incoming::PairCancel { pairing } => pairing::cancel(state, device, &pairing).await,
+    };
+    match replied {
+        Ok(reply) => reply.map(|reply| reply.to_string()),
+        Err(error) => {
+            tracing::error!(%error, "a pairing step failed");
+            Some(json!({ "type": "error", "message": "server error" }).to_string())
+        }
     }
 }

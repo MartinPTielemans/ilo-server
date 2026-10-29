@@ -36,7 +36,7 @@ The most common defect is a change that works on the path you tested and is miss
 
 - **Both databases.** Every query runs on SQLite and Postgres through sqlx's `Any` driver: `$1` parameters, `ON CONFLICT`, `RETURNING`; flags as integers, times as Unix seconds, and `BIGINT`/`BYTEA` in the Postgres migration where SQLite has `INTEGER`/`BLOB`. Run the tests on both.
 - **Chromium's client.** A sync change keeps working for the unmodified engine: ids, the version order of GetUpdates, conflict answers, tombstones, birthdays.
-- **ilo's client.** The relay's frames (documented at the top of `src/relay.rs`), the OIDC endpoints and `/api/` are what ilo's core builds on. A change to them is a change to its contract; say so in the PR.
+- **ilo's client.** The OIDC endpoints, `/api/`, the relay's frames and pairing are what ilo's core builds on, and `docs/protocol.md` is their contract. A change to them rewrites it, and the PR says so. Pairing's cryptography changes only with its version label (`ilo pairing v1`) and the reference client in `tests/pairing/client.rs`.
 - **Self-hosters.** A new setting is an environment variable, read in `src/config.rs`, with its default and its row in the README's table, and in `docker-compose.yml` and `.env.example` when a self-hoster sets it.
 - **Railway.** `.railway/railway.ts` follows a change in how the service runs: healthcheck, replicas, database.
 - **Sign-in pages.** They run in an ilo tab: light and dark, keyboard only, and screen readers (the alerts use `role="alert"`). Their look is the browser's tokens (`app/design/tokens.toml` there), and their CSP allows nothing inline, so style goes in `sign-in.css` and script in `sign-in.js`.
@@ -75,7 +75,8 @@ The most common defect is a change that works on the path you tested and is miss
 ## Where code lives
 
 - `src/accounts/`: sign-in pages, passkeys, the OIDC provider, devices.
-- `src/sync.rs`: `/command/`. `src/relay.rs`: `/relay`. `src/tokens.rs`: the device tokens both accept.
+- `src/sync.rs`: `/command/`. `src/relay.rs`: `/relay`, and `src/pairing.rs` the pairing steps it carries. `src/tokens.rs`: the device tokens both accept.
+- `docs/protocol.md`: the contract with clients.
 - `proto/`: Chromium's sync protocol, vendored.
 
 ## Taste
