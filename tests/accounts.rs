@@ -241,6 +241,27 @@ async fn refreshing_rotates_the_refresh_token_and_revoking_signs_the_device_out(
 }
 
 #[tokio::test]
+async fn a_refresh_token_renews_once_even_when_two_refreshes_race() {
+    let server = start().await;
+    let device = server.device(&unique_email("race-refresh"), "Test").await;
+    let refreshes = (0..10).map(|_| {
+        reqwest::Client::new()
+            .post(format!("{}/token", server.url))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", device.refresh_token.as_str()),
+            ])
+            .send()
+    });
+    let answers = futures_util::future::join_all(refreshes).await;
+    let renewed = answers
+        .iter()
+        .filter(|answer| answer.as_ref().unwrap().status() == 200)
+        .count();
+    assert_eq!(renewed, 1, "a copied refresh token can't fork the device");
+}
+
+#[tokio::test]
 async fn a_passkey_is_offered_once_after_the_first_sign_in() {
     let server = start().await;
     let email = unique_email("passkey");
