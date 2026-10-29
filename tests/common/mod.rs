@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod passkey;
+
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -204,6 +206,31 @@ impl Server {
                 .unwrap();
         }
         self.done(&browser, answer).await
+    }
+
+    /// Signs `email` in for the first time and takes the passkey offer.
+    pub async fn add_passkey(&self, email: &str) -> passkey::SoftPasskey {
+        let browser = browser();
+        let offer = self.enter_code(&browser, email, &pkce()).await;
+        assert!(offer.text().await.unwrap().contains("Add a passkey"));
+        let options: Value = browser
+            .post(format!("{}/authorize/passkey/register", self.url))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let (passkey, credential) = passkey::SoftPasskey::create(&options, &self.url);
+        let added = browser
+            .post(format!("{}/authorize/passkey/register/finish", self.url))
+            .json(&credential)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(added.status(), 200, "{}", added.text().await.unwrap());
+        passkey
     }
 
     pub async fn exchange(
