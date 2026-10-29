@@ -267,6 +267,87 @@ async fn an_address_gets_five_codes_an_hour_however_many_sign_ins_ask() {
     }
 }
 
+/// A new sign-in from the client at `ip` asking for a code to `email`: the page it gets.
+async fn ask_for_a_code(server: &Server, email: &str, ip: &str) -> String {
+    let browser = browser();
+    browser
+        .get(server.authorize_url(&pkce(), "s"))
+        .send()
+        .await
+        .unwrap();
+    browser
+        .post(format!("{}/authorize/email", server.url))
+        .header("x-real-ip", ip)
+        .form(&[("email", email)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_client_gets_its_codes_an_hour_however_many_addresses_it_asks_for() {
+    let server = start_alone(&[("CODES_PER_CLIENT_PER_HOUR", "2")]).await;
+    let sent = || server.mail.lock().unwrap().len();
+    for n in 1..=2 {
+        let page = ask_for_a_code(&server, &unique_email("client"), "203.0.113.7").await;
+        assert!(page.contains("Check your email"), "{page}");
+        assert_eq!(sent(), n);
+    }
+    let page = ask_for_a_code(&server, &unique_email("client"), "203.0.113.7").await;
+    assert!(page.contains("from your network"), "{page}");
+    assert_eq!(
+        sent(),
+        2,
+        "the client's third address in an hour mails nothing"
+    );
+    // The address it was refused for, which it didn't use up, gets one from elsewhere.
+    let page = ask_for_a_code(&server, &unique_email("client"), "198.51.100.7").await;
+    assert!(page.contains("Check your email"), "{page}");
+    // A list names the client last, as a proxy appends the address it saw.
+    let page = ask_for_a_code(&server, &unique_email("client"), "192.0.2.1, 203.0.113.7").await;
+    assert!(page.contains("from your network"), "{page}");
+}
+
+#[tokio::test]
+async fn an_ipv6_client_counts_by_its_network() {
+    let server = start_alone(&[("CODES_PER_CLIENT_PER_HOUR", "1")]).await;
+    let page = ask_for_a_code(&server, &unique_email("v6"), "2001:db8:1:2::1").await;
+    assert!(page.contains("Check your email"), "{page}");
+    let page = ask_for_a_code(&server, &unique_email("v6"), "2001:db8:1:2:ffff::9").await;
+    assert!(page.contains("from your network"), "{page}");
+    let page = ask_for_a_code(&server, &unique_email("v6"), "2001:db8:1:3::1").await;
+    assert!(page.contains("Check your email"), "{page}");
+}
+
+#[tokio::test]
+async fn the_server_mails_its_codes_a_day_and_a_refused_client_takes_none() {
+    let server = start_alone(&[("CODES_PER_CLIENT_PER_HOUR", "1"), ("CODES_PER_DAY", "2")]).await;
+    let sent = || server.mail.lock().unwrap().len();
+    let page = ask_for_a_code(&server, &unique_email("day"), "203.0.113.1").await;
+    assert!(page.contains("Check your email"), "{page}");
+    // Refused for its client, so the day keeps the code.
+    let page = ask_for_a_code(&server, &unique_email("day"), "203.0.113.1").await;
+    assert!(page.contains("from your network"), "{page}");
+    let page = ask_for_a_code(&server, &unique_email("day"), "203.0.113.2").await;
+    assert!(page.contains("Check your email"), "{page}");
+    let email = unique_email("day");
+    let page = ask_for_a_code(&server, &email, "203.0.113.3").await;
+    assert!(page.contains("all the codes it can for today"), "{page}");
+    assert_eq!(sent(), 2);
+    // The refusal gave back the address's and the client's codes.
+    let left: Vec<(String, i64)> =
+        sqlx::query_as("SELECT name, sent FROM code_limits WHERE name IN ($1, $2)")
+            .bind(format!("address {email}"))
+            .bind("client 203.0.113.3")
+            .fetch_all(&server.db)
+            .await
+            .unwrap();
+    assert!(left.iter().all(|(_, sent)| *sent == 0), "{left:?}");
+}
+
 #[tokio::test]
 async fn sign_ins_asking_at_once_still_get_five_codes_an_hour() {
     let server = start().await;
