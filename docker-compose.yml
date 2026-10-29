@@ -11,7 +11,11 @@ services:
       DATABASE_URL: postgres://ilo:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db/ilo
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       DEV_MODE: ${DEV_MODE:-}
+      # SMTP_URL, or MAIL_API and its two settings: .env.example says which.
       SMTP_URL: ${SMTP_URL:-}
+      MAIL_API: ${MAIL_API:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       MAIL_FROM: ${MAIL_FROM:-}
     depends_on:
       db:
