@@ -75,7 +75,7 @@ Run one instance. The relay keeps connections in its process.
 |---|---|
 | `GET /.well-known/openid-configuration` | OIDC discovery. The client id is `ilo`, a public client using the code flow with PKCE (S256). |
 | `GET /authorize` | The sign-in pages: email or a passkey, the mailed code, a passkey offered once after an account's first sign-in, and a done page that sends the tab back to the client with `code`, `state` and `iss`. |
-| `POST /token` | `authorization_code` (takes an optional `device_name`) and `refresh_token`. Each code exchange makes a device. Refresh tokens rotate. |
+| `POST /token` | `authorization_code` (takes an optional `device_name`) and `refresh_token`. Each code exchange makes a device, and mails the account when it already had one. Refresh tokens rotate. |
 | `GET /userinfo`, `GET /jwks`, `POST /revoke` | Revoking a refresh token signs its device out. |
 | `POST /command/` | Chromium sync: GetUpdates, Commit, ClearServerData. Bearer access token. |
 | `GET /relay` | The device's WebSocket, which also carries pairing. Bearer access token. |

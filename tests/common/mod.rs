@@ -123,10 +123,10 @@ impl Server {
         let mail = self.mail.lock().unwrap();
         mail.iter()
             .rev()
-            .find(|mail| mail.to == email)
+            .filter(|mail| mail.to == email)
+            .find_map(|mail| mail.subject.strip_suffix(" is your ilo sign-in code"))
             .expect("no code was mailed")
-            .code
-            .clone()
+            .to_owned()
     }
 
     pub fn authorize_url(&self, pkce: &Pkce, state: &str) -> String {
