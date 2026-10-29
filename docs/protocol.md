@@ -71,6 +71,8 @@ The new device is the **requester**; the device that holds the secret and answer
 
 After step 3, the approver checks that `KR` is the key `C` committed to, and both show the match code. The user approves on the approver only if the two codes are the same; otherwise the approver cancels.
 
+Each side takes one key from the other per pairing: the requester the first `pair_accept`, the approver the first `pair_reveal`. Another for the same pairing is someone between the devices trying keys, so that side cancels. The server never sends a second, but it is the party the rule guards against: a requester that took a second `pair_accept` after revealing `KR` would let the server pick that key knowing both `KR` and the code the approver shows, and make the codes match in about a second.
+
 Either device sends `{"type":"pair_cancel","pairing":P}` to stop. Before a device accepts, any of the account's devices may, such as one whose user didn't start the request. The other side gets `{"type":"pair_closed","pairing":P,"reason":R}`, where `R` is `cancelled`, `taken`, `expired`, `unreachable` or `done`.
 
 ### The server's rules
