@@ -9,9 +9,9 @@ use axum::response::{Html, IntoResponse, Response};
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
      connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
-/// ilo's mark, the dot and the stem from its icon (the browser's
-/// `app/branding/ilo.icon`), with the stem in the page's ink.
-const MARK: &str = r##"<svg class="mark" viewBox="419.8 184.3 184.4 624.7" role="img" aria-label="ilo"><circle cx="512" cy="276.5" r="92.2" fill="#0E9F55"/><rect x="445.4" y="450.6" width="133.1" height="358.4" rx="66.6" fill="currentColor"/></svg>"##;
+/// ilo's wordmark, a dot, two stems and a ring, with the dot in Signal green and the rest in
+/// the page's ink. The code mail shows it as PNGs drawn from this (src/mail).
+const MARK: &str = r##"<svg class="mark" viewBox="4 16 217 154" role="img" aria-label="ilo"><circle cx="19" cy="31" r="15" fill="#0E9F55"/><rect x="7" y="70" width="24" height="100" rx="12" fill="currentColor"/><rect x="67" y="20" width="24" height="150" rx="12" fill="currentColor"/><circle cx="171" cy="120" r="38" fill="none" stroke="currentColor" stroke-width="24"/></svg>"##;
 
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")

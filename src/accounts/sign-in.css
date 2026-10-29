@@ -1,5 +1,7 @@
-/* ilo's look, from the browser's design tokens (app/design/tokens.toml): Ink and
-   Paper, its dialog's card, fields and buttons, and ilo green as the accent. */
+/* ilo's look, from the brand and the browser's design tokens (app/design/tokens.toml):
+   Paper and Ink, the dialog's card, fields and buttons, and Signal green, the wordmark's
+   dot, as the accent, since the pages are in no Space. The sign-in code mail
+   (src/mail/code.html) uses the same colours. */
 
 :root {
   color-scheme: light dark;
@@ -8,13 +10,13 @@
   --card: #f3f0e8;
   --rim: rgb(22 20 15 / 0.14);
   --error: #b3261e;
-  --accent: #289054;
+  --accent: #0e9f55;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --on: 243 240 232;
-    --ground: #131313;
+    --ground: #16140f;
     --card: #2a2720;
     --rim: rgb(255 255 255 / 0.12);
     --error: #f07a63;
@@ -31,7 +33,7 @@ body {
   padding: 16px;
   background: var(--ground);
   color: rgb(var(--on) / 0.92);
-  font: 13px/1.45 -apple-system, "Inter", system-ui, sans-serif;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
