@@ -146,14 +146,35 @@ async fn exchange_code(state: &Shared, request: TokenRequest) -> anyhow::Result<
         id: db::random_id(),
         account_id: found.account_id,
     };
+    let name = if name.is_empty() {
+        "ilo".to_owned()
+    } else {
+        name
+    };
+    let had_devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE account_id = $1")
+        .bind(&device.account_id)
+        .fetch_one(&state.db)
+        .await?;
     let now = db::now();
     sqlx::query("INSERT INTO devices (id, account_id, name, created_at, last_seen_at) VALUES ($1, $2, $3, $4, $4)")
         .bind(&device.id)
         .bind(&device.account_id)
-        .bind(if name.is_empty() { "ilo".to_owned() } else { name })
+        .bind(&name)
         .bind(now)
         .execute(&state.db)
         .await?;
+    // A device someone else signed in would otherwise show only in Settings.
+    // The first device's owner just read the code mail, so it gets no second one.
+    if had_devices > 0 {
+        let to = crate::accounts::email(&state.db, &device.account_id).await?;
+        let mailer = state.mailer.clone();
+        // Off the token answer's path, so a slow mail server can't hold up a sign-in.
+        tokio::spawn(async move {
+            if let Err(error) = mailer.send_new_sign_in(&to, &name).await {
+                tracing::warn!(%error, "can't mail a new-sign-in notice");
+            }
+        });
+    }
     let tokens = tokens::issue(&state.db, &device.id).await?;
     respond(
         state,
