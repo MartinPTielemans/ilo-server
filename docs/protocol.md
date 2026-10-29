@@ -10,7 +10,7 @@ The server is an OpenID Connect provider (`/.well-known/openid-configuration`). 
 
 ilo opens `/authorize` in a tab. The user enters their email and then the 6-digit code mailed to it. A code works for 10 minutes and for 5 tries, a sign-in may ask for one new code, and an address gets at most 5 codes an hour, however many sign-ins ask. An account with a passkey is offered it before a code. After an account's first sign-in, the pages offer a passkey once. Each way ends on `/authorize/done`, which sends the tab on after a second to the redirect URI with `code`, `state` and `iss`.
 
-`POST /token` exchanges the code (`grant_type=authorization_code`, `code_verifier`, and `device_name`, which the device list shows). Each exchange makes a **device** and gives it:
+`POST /token` exchanges the code (`grant_type=authorization_code`, `code_verifier`, and `device_name`, which the device list shows). If the account already has a device, the server mails its address that a device of that name signed in. Each exchange makes a **device** and gives it:
 
 - an access token, valid for an hour, sent as `Authorization: Bearer` to `/command/`, `/relay`, `/userinfo` and `/api/`. An expired or revoked one gets `401` with `WWW-Authenticate: Bearer`, never `403`;
 - a refresh token, valid for 90 days, which `grant_type=refresh_token` exchanges for a new pair. Each refresh token works once;

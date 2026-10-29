@@ -229,6 +229,40 @@ async fn an_address_gets_five_codes_an_hour_however_many_sign_ins_ask() {
 }
 
 #[tokio::test]
+async fn a_new_device_signing_in_is_mailed_to_the_account_but_the_first_isnt() {
+    let server = start().await;
+    let email = unique_email("notice");
+    let notices = || {
+        server
+            .mail
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|mail| mail.to == email && mail.subject.contains("new device"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    server.device(&email, "Mac").await;
+    server.device(&email, "Mallory\nlaptop").await;
+    // The notice goes out beside the token answer, not before it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while notices().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let notices = notices();
+    assert_eq!(
+        notices.len(),
+        1,
+        "only the second device is news: {notices:?}"
+    );
+    assert!(
+        notices[0].body.contains("\"Mallory laptop\""),
+        "the name, on one line: {}",
+        notices[0].body
+    );
+}
+
+#[tokio::test]
 async fn the_code_flow_needs_pkce_and_a_known_redirect() {
     let server = start().await;
     let unknown = server
