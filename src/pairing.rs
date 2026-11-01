@@ -101,6 +101,12 @@ pub async fn request(
     if made >= REQUESTS_PER_HOUR {
         return Ok(error(None, "too many pairing requests; try again later"));
     }
+    // What the server knows of the requester, beside what it says of itself: when it signed in
+    // and when it asked. The approver shows them, as the name and system are the requester's word.
+    let signed_in_at: i64 = sqlx::query_scalar("SELECT created_at FROM devices WHERE id = $1")
+        .bind(&device.id)
+        .fetch_one(&state.db)
+        .await?;
     let id = db::random_id();
     let expires_at = now + LIFETIME;
     let frame = json!({
@@ -110,6 +116,8 @@ pub async fn request(
         "name": name,
         "os": os,
         "commitment": commitment,
+        "asked_at": now,
+        "signed_in_at": signed_in_at,
         "expires_at": expires_at,
     })
     .to_string();

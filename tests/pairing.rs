@@ -53,6 +53,18 @@ async fn a_new_device_gets_the_secret_from_another_once_their_codes_match() {
         (&request["name"], &request["os"]),
         (&json!("Laptop"), &json!("macOS"))
     );
+    // The server's own word on the requester: when it signed in, and when it asked.
+    let now = ilo_server::db::now();
+    let (asked_at, signed_in_at) = (
+        request["asked_at"].as_i64().unwrap(),
+        request["signed_in_at"].as_i64().unwrap(),
+    );
+    assert!(signed_in_at <= asked_at && asked_at <= now, "{request}");
+    assert!(
+        now - signed_in_at < 60,
+        "the laptop signed in just now: {request}"
+    );
+    assert_eq!(request["expires_at"].as_i64().unwrap(), asked_at + 5 * 60);
     let mac_keys = KeyPair::generate();
     mac.send(
         json!({ "type": "pair_accept", "pairing": pairing, "public_key": text(&mac_keys.public) }),
