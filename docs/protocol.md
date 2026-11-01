@@ -65,7 +65,7 @@ The new device is the **requester**; the device that holds the secret and answer
 
 | | Requester sends | The others get |
 |---|---|---|
-| 1 | `{"type":"pair_request","commitment":C,"name":N,"os":O}` | Every other device of the account: `{"type":"pair_request","pairing":P,"from":ID,"name":N,"os":O,"commitment":C,"expires_at":T}`. The requester gets `{"type":"pair_requested","pairing":P,"expires_at":T}`. |
+| 1 | `{"type":"pair_request","commitment":C,"name":N,"os":O}` | Every other device of the account: `{"type":"pair_request","pairing":P,"from":ID,"name":N,"os":O,"commitment":C,"asked_at":A,"signed_in_at":S,"expires_at":T}`, where `A` is when it asked and `S` when the requester signed in, by the server's clock in seconds, so the approver has more than the requester's own word for `N` and `O`. The requester gets `{"type":"pair_requested","pairing":P,"expires_at":T}`. |
 | 2 | (Approver) `{"type":"pair_accept","pairing":P,"public_key":KA}` | The requester: `{"type":"pair_accept","pairing":P,"from":ID,"public_key":KA}`. The account's other devices: `pair_closed` with `"reason":"taken"`. |
 | 3 | `{"type":"pair_reveal","pairing":P,"public_key":KR}` | The approver: `{"type":"pair_reveal","pairing":P,"public_key":KR}`. |
 | 4 | (Approver) `{"type":"pair_seal","pairing":P,"sealed":S}` | The requester: `{"type":"pair_sealed","pairing":P,"from":ID,"sealed":S}`. The approver gets `pair_closed` with `"reason":"done"`. |
