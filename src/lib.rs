@@ -37,6 +37,8 @@ pub struct AppState {
     pub db: db::Db,
     pub mailer: Mailer,
     pub relay: relay::Relay,
+    /// Each account's commits this minute, for SYNC_COMMITS_PER_MINUTE.
+    pub commits: sync::CommitRate,
     webauthn: Webauthn,
     signer: jwt::Signer,
 }
@@ -59,6 +61,7 @@ pub async fn state(config: Config, mailer: Mailer) -> anyhow::Result<Shared> {
         db,
         mailer,
         relay: relay::Relay::default(),
+        commits: sync::CommitRate::default(),
         webauthn,
         signer,
     }))

@@ -488,3 +488,92 @@ async fn an_expired_token_gets_401_and_a_refreshed_one_syncs() {
     let synced = mac.get_updates(vec![marker(PREFERENCES, None)]).await;
     assert_eq!(synced.error_code(), ErrorType::Success);
 }
+
+/// The throttle delay a refused commit gives, in seconds.
+fn wait_of(response: &pb::ClientToServerResponse) -> i32 {
+    response
+        .client_command
+        .as_ref()
+        .and_then(|command| command.throttle_delay_seconds)
+        .unwrap_or(0)
+}
+
+/// What the server keeps of the account's preferences, as a new device would get them.
+async fn kept(client: &mut Client) -> usize {
+    let updates = client.get_updates(vec![marker(PREFERENCES, None)]).await;
+    updates
+        .get_updates
+        .unwrap()
+        .entries
+        .iter()
+        .filter(|entity| !entity.deleted() && entity.server_defined_unique_tag.is_none())
+        .count()
+}
+
+#[tokio::test]
+async fn an_account_past_its_commits_a_minute_is_told_to_wait() {
+    let server = start_alone(&[("SYNC_COMMITS_PER_MINUTE", "2")]).await;
+    let email = unique_email("rate");
+    let mut mac = server.device(&email, "Mac").await;
+    let mut laptop = server.device(&email, "Laptop").await;
+    for tag in ["a", "b"] {
+        let committed = mac.commit(vec![preference(tag, 0, b"x")]).await;
+        assert_eq!(committed.error_code(), ErrorType::Success);
+    }
+    // The account's, from any of its devices.
+    let refused = laptop.commit(vec![preference("c", 0, b"x")]).await;
+    assert_eq!(refused.error_code(), ErrorType::Throttled);
+    let wait = wait_of(&refused);
+    assert!((1..=60).contains(&wait), "waits {wait} s");
+    assert!(refused.commit.is_none(), "a refused commit keeps nothing");
+    assert_eq!(kept(&mut laptop).await, 2);
+
+    // Another account has its own minute.
+    let mut other = server.device(&unique_email("rate"), "Mac").await;
+    let committed = other.commit(vec![preference("a", 0, b"x")]).await;
+    assert_eq!(committed.error_code(), ErrorType::Success);
+}
+
+#[tokio::test]
+async fn a_full_account_waits_an_hour_and_can_still_delete() {
+    let server = start_alone(&[("SYNC_ITEMS_PER_ACCOUNT", "2")]).await;
+    let mut mac = server.device(&unique_email("full"), "Mac").await;
+    let committed = mac
+        .commit(vec![preference("a", 0, b"x"), preference("b", 0, b"x")])
+        .await;
+    assert_eq!(committed.error_code(), ErrorType::Success);
+    let a = committed.commit.unwrap().entryresponse[0].clone();
+
+    let refused = mac.commit(vec![preference("c", 0, b"x")]).await;
+    assert_eq!(refused.error_code(), ErrorType::Throttled);
+    assert_eq!(wait_of(&refused), 3600);
+    assert_eq!(kept(&mut mac).await, 2);
+
+    // A deletion makes room, and the next item fits.
+    let deleted = mac
+        .commit(vec![SyncEntity {
+            id_string: a.id_string.clone(),
+            version: a.version,
+            deleted: Some(true),
+            client_tag_hash: Some("a".into()),
+            specifics: Some(encrypted_specifics(PREFERENCES, b"")),
+            ..Default::default()
+        }])
+        .await;
+    assert_eq!(deleted.error_code(), ErrorType::Success);
+    let committed = mac.commit(vec![preference("c", 0, b"x")]).await;
+    assert_eq!(committed.error_code(), ErrorType::Success);
+    assert_eq!(kept(&mut mac).await, 2);
+}
+
+#[tokio::test]
+async fn an_account_keeps_at_most_its_megabytes() {
+    let server = start_alone(&[("SYNC_MB_PER_ACCOUNT", "1")]).await;
+    let mut mac = server.device(&unique_email("bytes"), "Mac").await;
+    let half = vec![7; 600 * 1024];
+    let committed = mac.commit(vec![preference("a", 0, &half)]).await;
+    assert_eq!(committed.error_code(), ErrorType::Success);
+    let refused = mac.commit(vec![preference("b", 0, &half)]).await;
+    assert_eq!(refused.error_code(), ErrorType::Throttled);
+    assert_eq!(kept(&mut mac).await, 1);
+}

@@ -48,8 +48,6 @@ docker run -d --name ilo-server -p 8080:8080 -v ilo-data:/data \
 
 **To try it** on your own machine, with codes in the log instead of mail: `docker run --rm -p 8080:8080 -e DEV_MODE=1 ilo-server`, or `DEV_MODE=1 cargo run`.
 
-Back up the database: it holds accounts, the key that signs ID tokens, and the encrypted sync data.
-
 **On Railway**, a service made from this repo builds its Dockerfile, and Railway gives it `PORT` and `RAILWAY_PUBLIC_DOMAIN`, which `PUBLIC_URL` defaults to. Add a Postgres database and set the service's `DATABASE_URL` to the database's, set `MAIL_API=cloudflare`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` and `MAIL_FROM`, since Railway blocks outbound SMTP on its Free, Trial and Hobby plans, and Railway reads the `/health` health check and the one replica from [`railway.json`](railway.json). [`.railway/railway.ts`](.railway/railway.ts) describes the same for `railway config apply`; it hasn't been tried yet.
 
 ### Proxies
@@ -58,7 +56,32 @@ The relay is a WebSocket on `/relay`. A proxy in front has to pass `Upgrade` thr
 
 Sign-in counts the codes each client asks for by its address, so a proxy has to name it: set `CLIENT_IP_HEADER` to the header the proxy puts it in, such as `X-Real-IP` with nginx's `proxy_set_header X-Real-IP $remote_addr`, or `X-Forwarded-For`, whose last address counts. Name only a header the proxy sets itself, or a client can claim any address. Without a proxy, leave it unset, and the connection's address counts.
 
-Run one instance. The relay keeps connections in its process.
+Run one instance. The relay keeps connections in its process, and the commit rate is counted there.
+
+### Backing up and restoring
+
+The database holds the accounts' addresses, their devices and passkeys, the key that signs ID tokens, and the encrypted sync data. Losing the signing key signs every device out. Losing the sync data loses nothing the devices still have: each sends its own copy again, which its recovery words still open, as the key to them never leaves the devices. A backup holds every address, so encrypt it, such as with [age](https://age-encryption.org) to a key kept offline, and keep it off the server's host.
+
+Back up daily, and before every upgrade.
+
+- **Postgres** (Compose): `docker compose exec -T db pg_dump -U ilo -Fc ilo > ilo-$(date +%F).dump` while it runs.
+- **SQLite** (one container): stop the server for the copy, so the database and its write-ahead log are taken together: `docker stop ilo-server`, then `docker run --rm -v ilo-data:/data -v "$PWD":/backup debian:trixie-slim sh -c 'cp /data/ilo-server.db* /backup/'`, then `docker start ilo-server`. With `sqlite3` where the file is, `sqlite3 ilo-server.db ".backup ilo-$(date +%F).db"` copies it while it runs.
+
+To restore, stop the server, put the copy back, and start it:
+
+- **Postgres:** `docker compose stop server`, `docker compose exec -T db pg_restore -U ilo -d ilo --clean --if-exists < ilo-….dump`, `docker compose start server`.
+- **SQLite:** `docker stop ilo-server`, copy the backup's files back into the volume as above, the other way round, with the old `-wal` and `-shm` files gone if the backup has none, and `docker start ilo-server`.
+
+Then check that `/health` says `ok` and that a device signs in. A restore takes the server back to the backup's moment: a device that signed in since signs in again, and what a device synced since stays on it but reaches the others only once it changes again. Try a restore now and then, into a scratch database with a second server on a port of its own, so the day you need one isn't the first.
+
+### Upgrading
+
+Back up first. Migrations run as the server starts and can't be undone, so going back to an older version means restoring the backup taken before the upgrade.
+
+- **Compose:** `git pull`, then `docker compose up -d --build`.
+- **One container:** `git pull`, `docker build -t ilo-server .`, then `docker rm -f ilo-server` and the same `docker run` as before, with the same volume.
+
+Then check that `/health` says `ok`.
 
 ## Configuration
 
@@ -74,6 +97,9 @@ Run one instance. The relay keeps connections in its process.
 | `CLIENT_IP_HEADER` | `X-Real-IP` on Railway, else none | The header the proxy in front puts the client's address in, which the code limits count by; none counts the connection's address. |
 | `CODES_PER_CLIENT_PER_HOUR` | `10` | Sign-in codes mailed in an hour to sign-ins from one client (an IPv6 client by its /64), across every address it asks for. Each address also gets at most 5 an hour. |
 | `CODES_PER_DAY` | `800` | Codes the server mails in a day, all clients together: keep it under your mail account's daily quota, with room for new-sign-in notices. |
+| `SYNC_ITEMS_PER_ACCOUNT` | `200000` | The most items one account keeps, the server's own folders aside. Past it, a commit that adds or changes items is answered with Chromium's throttling error, and the client waits an hour before it tries again; deleting always goes through. |
+| `SYNC_MB_PER_ACCOUNT` | `256` | The most megabytes of items one account keeps, answered the same way. |
+| `SYNC_COMMITS_PER_MINUTE` | `120` | Commits one account makes in a minute, all its devices together. Past it, the client waits for the next minute. A first sync sends 25 items a commit. |
 | `OIDC_REDIRECT_URIS` | | More redirect URIs to allow, comma-separated, besides loopback addresses and `$PUBLIC_URL/signed-in`. |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | Where it listens. |
 | `LOG` | `info` | Log filter, such as `debug` or `ilo_server=debug`. |

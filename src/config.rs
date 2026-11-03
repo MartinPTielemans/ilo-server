@@ -24,6 +24,8 @@ pub struct Config {
     pub codes_per_client_per_hour: i64,
     /// Codes the server mails in a day, under the mail account's quota.
     pub codes_per_day: i64,
+    /// What one account may keep and send, so one signed-in account can't fill the database.
+    pub sync_limits: crate::sync::Limits,
 }
 
 /// One way to send mail, which the server sets up at start.
@@ -120,6 +122,15 @@ impl Config {
                 None => Ok(default),
             }
         };
+        let count = |name: &str, default: i64| -> anyhow::Result<i64> {
+            match var(name) {
+                Some(value) => match value.parse() {
+                    Ok(count) if count >= 1 => Ok(count),
+                    _ => bail!("{name} is not a number, 1 or more"),
+                },
+                None => Ok(default),
+            }
+        };
         Ok(Self {
             host: var("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port,
@@ -136,6 +147,13 @@ impl Config {
             codes_per_client_per_hour: limit("CODES_PER_CLIENT_PER_HOUR", 10)?,
             // The hosted copy's mail account sends 1,000 a day, with room for new-sign-in notices.
             codes_per_day: limit("CODES_PER_DAY", 800)?,
+            sync_limits: crate::sync::Limits {
+                // Chromium's own limit on bookmarks is 100,000, and each other item is smaller.
+                items: count("SYNC_ITEMS_PER_ACCOUNT", 200_000)?,
+                bytes: count("SYNC_MB_PER_ACCOUNT", 256)? * 1024 * 1024,
+                // A first sync sends its items 25 to a commit, one after another.
+                commits_per_minute: count("SYNC_COMMITS_PER_MINUTE", 120)?,
+            },
         })
     }
 

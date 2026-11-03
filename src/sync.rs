@@ -12,6 +12,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -93,7 +95,8 @@ pub async fn command(
     let Ok(message) = pb::ClientToServerMessage::decode(body.as_slice()) else {
         return (StatusCode::BAD_REQUEST, "not a ClientToServerMessage").into_response();
     };
-    match handle(&state.db, &device, message).await {
+    let limits = (&state.config.sync_limits, &state.commits);
+    match handle(&state.db, &device, message, limits).await {
         Ok(Handled { response, changed }) => {
             if let Some(types) = changed {
                 state
@@ -200,10 +203,90 @@ pub struct Handled {
     pub changed: Option<BTreeSet<i32>>,
 }
 
+/// What one account may keep and send (SYNC_ITEMS_PER_ACCOUNT, SYNC_MB_PER_ACCOUNT,
+/// SYNC_COMMITS_PER_MINUTE), so one signed-in account can't fill the database or keep it busy.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub items: i64,
+    pub bytes: i64,
+    pub commits_per_minute: i64,
+}
+
+/// How long a client waits once its account is full, before it tries again: long enough not to
+/// keep the server busy, as nothing frees the room but the user deleting.
+const FULL_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// Each account's commits in the minute that started with its first, counted in this process,
+/// as the server runs as one (AGENTS.md). A restart forgets them, which lets a minute's more in.
+#[derive(Default)]
+pub struct CommitRate(Mutex<HashMap<String, (Instant, i64)>>);
+
+impl CommitRate {
+    /// Counts a commit of `account`'s, or says how long it waits for its next minute.
+    fn take(&self, account: &str, per_minute: i64, now: Instant) -> Result<(), Duration> {
+        const MINUTE: Duration = Duration::from_secs(60);
+        let mut windows = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Swept as it's written, never on a timer (AGENTS.md).
+        if windows.len() > 10_000 {
+            windows.retain(|_, (start, _)| now.duration_since(*start) < MINUTE);
+        }
+        let (start, count) = windows.entry(account.to_owned()).or_insert((now, 0));
+        if now.duration_since(*start) >= MINUTE {
+            (*start, *count) = (now, 0);
+        }
+        if *count >= per_minute {
+            return Err(MINUTE - now.duration_since(*start));
+        }
+        *count += 1;
+        Ok(())
+    }
+}
+
+/// Chromium's answer to a client that must wait: THROTTLED, with how long, which it waits
+/// before it sends anything of the account's again, keeping its changes until then.
+fn throttled(response: &mut pb::ClientToServerResponse, wait: Duration) {
+    response.set_error_code(ErrorType::Throttled);
+    response.client_command = Some(pb::ClientCommand {
+        throttle_delay_seconds: Some(wait.as_secs().max(1).try_into().unwrap_or(i32::MAX)),
+        ..Default::default()
+    });
+}
+
+/// Whether `request` would take the account past what it may keep: by the items it adds and the
+/// bytes it sends, counted as if each were new, beside what it keeps already, but the server's own
+/// folders. One that only deletes always goes, so a full account can make room.
+async fn over_quota(
+    db: &Db,
+    account: &str,
+    request: &pb::CommitMessage,
+    limits: &Limits,
+) -> anyhow::Result<bool> {
+    let adding: Vec<&SyncEntity> = request.entries.iter().filter(|e| !e.deleted()).collect();
+    if adding.is_empty() {
+        return Ok(false);
+    }
+    let (items, bytes): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), coalesce(sum(length(entity)), 0) FROM sync_entities
+         WHERE account_id = $1 AND deleted = 0 AND server_tag IS NULL",
+    )
+    .bind(account)
+    .fetch_one(db)
+    .await?;
+    let new = adding.iter().filter(|e| e.version() == 0).count() as i64;
+    let sent: i64 = adding.iter().map(|e| e.encoded_len() as i64).sum();
+    Ok(items + new > limits.items || bytes + sent > limits.bytes)
+}
+
+/// Answers one sync command for `device`, whose commits count against the account's `limits` and
+/// its rate this minute.
 pub async fn handle(
     db: &Db,
     device: &Device,
     message: pb::ClientToServerMessage,
+    (limits, rate): (&Limits, &CommitRate),
 ) -> Result<Handled, Error> {
     let account = device.account_id.as_str();
     let store = ensure_store(db, account).await?;
@@ -227,6 +310,17 @@ pub async fn handle(
         }
         Ok(Contents::Commit) => {
             let request = message.commit.unwrap_or_default();
+            let wait = match rate.take(account, limits.commits_per_minute, Instant::now()) {
+                Err(wait) => Some(wait),
+                Ok(()) if over_quota(db, account, &request, limits).await? => Some(FULL_WAIT),
+                Ok(()) => None,
+            };
+            if let Some(wait) = wait {
+                tracing::info!(wait = wait.as_secs(), "throttled an account's commit");
+                throttled(&mut response, wait);
+                response.store_birthday = Some(birthday);
+                return Ok(Handled { response, changed });
+            }
             let (commit, types) = commit(db, account, &request).await?;
             response.commit = Some(commit);
             changed = (!types.is_empty()).then_some(types);
