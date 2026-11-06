@@ -17,6 +17,7 @@ services:
       SYNC_ITEMS_PER_ACCOUNT: ${SYNC_ITEMS_PER_ACCOUNT:-}
       SYNC_MB_PER_ACCOUNT: ${SYNC_MB_PER_ACCOUNT:-}
       SYNC_COMMITS_PER_MINUTE: ${SYNC_COMMITS_PER_MINUTE:-}
+      COUNTS_PASSWORD: ${COUNTS_PASSWORD:-}
       # SMTP_URL, or MAIL_API and its two settings: .env.example says which.
       SMTP_URL: ${SMTP_URL:-}
       MAIL_API: ${MAIL_API:-}

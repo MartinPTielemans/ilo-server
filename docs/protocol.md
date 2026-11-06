@@ -124,6 +124,13 @@ Each copy of ilo with Settings › Privacy › Send a Daily Usage Count on, whic
 
 A day's rows add up to its daily users, the `weekly` ones in an ISO week to that week's users, the `monthly` ones in a month to that month's, and the `first` ones to new installs. A count that fails isn't sent again until the copy's next launch that day, and a day the copy missed is never sent.
 
+### Reading them: `ilo-server counts` and `GET /counts`
+
+Both show the same numbers, from one query (`counts::read`): daily users and new installs for the last 14 UTC days, weekly users for the last 8 ISO weeks and monthly users for the last 6 months, newest first. The current week and month are still filling.
+
+- `ilo-server counts` prints them from `DATABASE_URL`, without migrating it.
+- `GET /counts` shows them as a page, with a bar chart of the 14 days' users. It's HTML with its style and chart inline, no script, and a Content-Security-Policy that loads nothing. It asks for HTTP Basic auth as user `ilo` with the server's `COUNTS_PASSWORD`, compared in constant time, and answers 401 with `WWW-Authenticate: Basic` to anything else. It sends `Cache-Control: no-store` and `X-Robots-Tag: noindex`. Without `COUNTS_PASSWORD` it answers 404, as a path the server doesn't have, so a server has no page unless its owner sets one. The password goes in a header, not the URL, because proxies' logs, Railway's included, record paths.
+
 ## What the server sees
 
 The README's [What the server can see](../README.md#what-the-server-can-see) lists it. Pairing adds the names and operating systems devices give in their requests, which devices pair and when, and the commitment, public keys and sealed secret, which are of no use without the devices' private keys. A request's details are dropped when it ends. The emptied row is kept for an hour, so the limit on requests can count it.

@@ -104,6 +104,7 @@ Then check that `/health` says `ok`.
 | `OIDC_REDIRECT_URIS` | | More redirect URIs to allow, comma-separated, besides loopback addresses and `$PUBLIC_URL/signed-in`. |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | Where it listens. |
 | `LOG` | `info` | Log filter, such as `debug` or `ilo_server=debug`. |
+| `COUNTS_PASSWORD` | | The password `GET /counts` asks for, as user `ilo`, to show the daily usage count's numbers. Unset, there's no page: `/counts` answers 404. Use a long random one: it's the page's only guard. |
 
 ## Endpoints
 
@@ -117,6 +118,7 @@ Then check that `/health` says `ok`.
 | `GET /relay` | The device's WebSocket, which also carries pairing. Bearer access token. |
 | `GET /api/devices`, `DELETE /api/devices/{id}`, `DELETE /api/account` | The account's devices, removing one, and deleting the account with all its data. |
 | `POST /v1/daily` | ilo's daily usage count, a JSON body of version, channel, OS, OS major, chip and flags, answered 204. It adds one to that day's row for those fields and keeps nothing else. `ilo-server counts` prints daily, weekly and monthly users and new installs. |
+| `GET /counts` | Those numbers as a page, with a chart of the last 14 days' users, behind HTTP Basic auth as user `ilo` with `COUNTS_PASSWORD`, so no secret goes in a URL a proxy's log records. Without the variable it answers 404. Never cached or indexed. |
 | `GET /health` | `ok` while the database answers. |
 
 ## Developing
@@ -125,6 +127,7 @@ Then check that `/health` says `ok`.
 DEV_MODE=1 cargo run       # serves on localhost:8080
 cargo test                 # on SQLite; ILO_TEST_DATABASE_URL=postgres://… for Postgres
 DATABASE_URL=… cargo run -- counts   # the daily usage count's users, by day, week and month
+DEV_MODE=1 COUNTS_PASSWORD=… cargo run   # and the same numbers at localhost:8080/counts
 ```
 
 [docs/protocol.md](docs/protocol.md) is the contract with clients: sign-in, sync, the relay's frames and pairing. [AGENTS.md](AGENTS.md) holds the project's rules and traps, and [CONTRIBUTING.md](CONTRIBUTING.md) how to send a change.

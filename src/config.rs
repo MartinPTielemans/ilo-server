@@ -26,6 +26,18 @@ pub struct Config {
     pub codes_per_day: i64,
     /// What one account may keep and send, so one signed-in account can't fill the database.
     pub sync_limits: crate::sync::Limits,
+    /// `COUNTS_PASSWORD`, which `GET /counts` asks for as user `ilo`. Without it there's no page.
+    pub counts_password: Option<Password>,
+}
+
+/// A password from the environment, which `Debug` never prints.
+#[derive(Clone)]
+pub struct Password(pub String);
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(..)")
+    }
 }
 
 /// One way to send mail, which the server sets up at start.
@@ -154,6 +166,7 @@ impl Config {
                 // A first sync sends its items 25 to a commit, one after another.
                 commits_per_minute: count("SYNC_COMMITS_PER_MINUTE", 120)?,
             },
+            counts_password: var("COUNTS_PASSWORD").map(Password),
         })
     }
 
@@ -219,6 +232,20 @@ mod tests {
                 if account_id == "account" && token == "secret-token"
         ));
         assert!(!format!("{config:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn the_counts_password_is_never_printed() {
+        let set = config(&[("DEV_MODE", "1"), ("COUNTS_PASSWORD", "secret-word")]).unwrap();
+        assert_eq!(
+            set.counts_password
+                .as_ref()
+                .map(|password| password.0.as_str()),
+            Some("secret-word")
+        );
+        assert!(!format!("{set:?}").contains("secret-word"));
+        let unset = config(&[("DEV_MODE", "1")]).unwrap();
+        assert!(unset.counts_password.is_none());
     }
 
     #[test]

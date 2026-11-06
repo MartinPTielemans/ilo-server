@@ -53,8 +53,7 @@ async fn print_counts() -> anyhow::Result<()> {
         .connect(&url)
         .await
         .context("can't open the database")?;
-    let today = ilo_server::counts::today();
-    let tallies = ilo_server::counts::tallies(&db, today - ilo_server::counts::REPORT_DAYS).await?;
-    print!("{}", ilo_server::counts::report(&tallies, today));
+    let numbers = ilo_server::counts::read(&db, ilo_server::counts::today()).await?;
+    print!("{}", numbers.text());
     Ok(())
 }

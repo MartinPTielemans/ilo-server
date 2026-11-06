@@ -139,3 +139,113 @@ async fn anything_ilo_doesnt_send_is_refused() {
     extra["id"] = json!("abc");
     assert_eq!(post(&server, &extra).await, reqwest::StatusCode::NO_CONTENT);
 }
+
+async fn counts_page(
+    server: &common::Server,
+    credentials: Option<(&str, &str)>,
+) -> reqwest::Response {
+    let request = reqwest::Client::new().get(format!("{}/counts", server.url));
+    let request = match credentials {
+        Some((user, password)) => request.basic_auth(user, Some(password)),
+        None => request,
+    };
+    request.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn without_a_password_there_is_no_counts_page() {
+    let server = common::start().await;
+    let page = counts_page(&server, None).await;
+    assert_eq!(page.status(), reqwest::StatusCode::NOT_FOUND);
+    let page = counts_page(&server, Some(("ilo", ""))).await;
+    assert_eq!(page.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_counts_page_asks_for_the_password() {
+    let server = common::start_alone(&[("COUNTS_PASSWORD", "a-long-test-password")]).await;
+    for credentials in [
+        None,
+        Some(("ilo", "wrong")),
+        Some(("admin", "a-long-test-password")),
+    ] {
+        let page = counts_page(&server, credentials).await;
+        assert_eq!(
+            page.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{credentials:?}"
+        );
+        let asks = page.headers()["www-authenticate"].to_str().unwrap();
+        assert!(asks.starts_with("Basic "), "{asks}");
+        assert_eq!(page.headers()["cache-control"], "no-store");
+        assert!(!page.text().await.unwrap().contains("users"));
+    }
+}
+
+#[tokio::test]
+async fn the_counts_page_shows_what_the_command_prints() {
+    let server = common::start_alone(&[("COUNTS_PASSWORD", "a-long-test-password")]).await;
+    let version = unique_version();
+    for body in [
+        count(&version, true, true, true),
+        count(&version, false, true, false),
+        count(&version, false, false, false),
+    ] {
+        assert_eq!(post(&server, &body).await, reqwest::StatusCode::NO_CONTENT);
+    }
+    let page = counts_page(&server, Some(("ilo", "a-long-test-password"))).await;
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let headers = page.headers().clone();
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["x-robots-tag"], "noindex");
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(
+        headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .starts_with("default-src 'none'")
+    );
+    let html = page.text().await.unwrap();
+    // Nothing from anywhere else, and no script.
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("src="));
+    assert!(!html.contains("href="));
+    assert!(html.contains("prefers-color-scheme: dark"));
+    assert!(html.contains("<svg"));
+
+    // The same numbers as `ilo-server counts`, from the same query, row by row.
+    let numbers = ilo_server::counts::read(&server.db, ilo_server::counts::today())
+        .await
+        .unwrap();
+    let today = &numbers.days[0];
+    assert_eq!((today.1, today.2), (3, 1));
+    assert_eq!(numbers.weeks[0].1, 2);
+    assert_eq!(numbers.months[0].1, 1);
+    for (day, users, new) in &numbers.days {
+        let row = format!("<th scope=\"row\">{day}</th><td>{users}</td><td>{new}</td>");
+        assert!(html.contains(&row), "no {row} in the page");
+    }
+    for (label, users) in numbers.weeks.iter().chain(&numbers.months) {
+        let row = format!("<th scope=\"row\">{label}</th><td>{users}</td>");
+        assert!(html.contains(&row), "no {row} in the page");
+    }
+    // And each of the command's lines has its row, so the two can't show different days.
+    let text = numbers.text();
+    let lines: Vec<&str> = text.lines().filter(|line| line.starts_with("  ")).collect();
+    assert_eq!(lines.len(), 14 + 8 + 6);
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let label = words.next().unwrap();
+        let cells: String = words.map(|word| format!("<td>{word}</td>")).collect();
+        let row = format!("<th scope=\"row\">{label}</th>{cells}");
+        assert!(
+            html.contains(&row),
+            "the command's {line:?} isn't in the page"
+        );
+    }
+}

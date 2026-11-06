@@ -5,7 +5,8 @@
 //!
 //! The rows give the numbers: a day's counts are its daily users, the counts flagged `weekly` in an
 //! ISO week its weekly users, those flagged `monthly` in a month its monthly users, and those
-//! flagged `first` new installs. `ilo-server counts` prints them.
+//! flagged `first` new installs. `ilo-server counts` prints them, and `GET /counts` shows them to
+//! whoever has `COUNTS_PASSWORD` (`counts_page.rs`).
 
 use std::collections::BTreeMap;
 
@@ -124,10 +125,28 @@ pub fn today() -> i64 {
     crate::db::now().div_euclid(DAY)
 }
 
-/// The report `ilo-server counts` prints, for the days up to `today`: daily users and new installs
-/// for the last 14 days, weekly users for the last 8 ISO weeks, and monthly users for the last 6
-/// months. The current week and month are still filling.
-pub fn report(tallies: &[Tally], today: i64) -> String {
+/// The numbers `ilo-server counts` prints and `GET /counts` shows, for the days up to a day:
+/// daily users and new installs for the last 14 days, weekly users for the last 8 ISO weeks, and
+/// monthly users for the last 6 months, each newest first. The current week and month are still
+/// filling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Numbers {
+    /// `YYYY-MM-DD`, users, new installs.
+    pub days: Vec<(String, i64, i64)>,
+    /// `YYYY-Www`, users.
+    pub weeks: Vec<(String, i64)>,
+    /// `YYYY-MM`, users.
+    pub months: Vec<(String, i64)>,
+}
+
+/// The numbers for the days up to `today`, from the database: the one query the command and the
+/// page share, so they can't drift apart.
+pub async fn read(db: &crate::db::Db, today: i64) -> anyhow::Result<Numbers> {
+    Ok(numbers(&tallies(db, today - REPORT_DAYS).await?, today))
+}
+
+/// The numbers the rows `tallies` give for the days up to `today`.
+pub fn numbers(tallies: &[Tally], today: i64) -> Numbers {
     let mut days: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
     let mut weeks: BTreeMap<i64, i64> = BTreeMap::new();
     let mut months: BTreeMap<(i64, u32), i64> = BTreeMap::new();
@@ -162,21 +181,42 @@ pub fn report(tallies: &[Tally], today: i64) -> String {
             *users += tally.count;
         }
     }
-    let mut out = String::from("Daily users (UTC)      users     new\n");
-    for (day, (users, new)) in days.iter().rev() {
-        let (year, month, date) = civil(*day);
-        out += &format!("  {year:04}-{month:02}-{date:02}         {users:>7} {new:>7}\n");
+    Numbers {
+        days: (days.iter().rev())
+            .map(|(day, (users, new))| {
+                let (year, month, date) = civil(*day);
+                (format!("{year:04}-{month:02}-{date:02}"), *users, *new)
+            })
+            .collect(),
+        weeks: (weeks.iter().rev())
+            .map(|(monday, users)| {
+                let (year, week) = iso_week(*monday);
+                (format!("{year:04}-W{week:02}"), *users)
+            })
+            .collect(),
+        months: (months.iter().rev())
+            .map(|((year, month), users)| (format!("{year:04}-{month:02}"), *users))
+            .collect(),
     }
-    out += "Weekly users (ISO)     users\n";
-    for (monday, users) in weeks.iter().rev() {
-        let (year, week) = iso_week(*monday);
-        out += &format!("  {year:04}-W{week:02}             {users:>7}\n");
+}
+
+impl Numbers {
+    /// As `ilo-server counts` prints them.
+    pub fn text(&self) -> String {
+        let mut out = String::from("Daily users (UTC)      users     new\n");
+        for (day, users, new) in &self.days {
+            out += &format!("  {day}         {users:>7} {new:>7}\n");
+        }
+        out += "Weekly users (ISO)     users\n";
+        for (week, users) in &self.weeks {
+            out += &format!("  {week}             {users:>7}\n");
+        }
+        out += "Monthly users          users\n";
+        for (month, users) in &self.months {
+            out += &format!("  {month}              {users:>7}\n");
+        }
+        out
     }
-    out += "Monthly users          users\n";
-    for ((year, month), users) in months.iter().rev() {
-        out += &format!("  {year:04}-{month:02}              {users:>7}\n");
-    }
-    out
 }
 
 /// The Monday of `day`'s ISO week. Day 0, 1970-01-01, was a Thursday.
@@ -266,7 +306,7 @@ mod tests {
             // Last week, in October: two.
             tally(monday - 3, false, true, true, 2),
         ];
-        let report = report(&tallies, today);
+        let report = numbers(&tallies, today).text();
         let line = |start: &str| {
             report
                 .lines()
