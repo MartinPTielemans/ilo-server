@@ -70,6 +70,12 @@ async fn counts_are_kept_as_numbers_per_day_and_fields() {
     let today = ilo_server::counts::today();
     // Two rows, one a count of two: nothing tells the copies apart.
     assert_eq!(rows, [(today, 0, 1, 0, 2), (today, 1, 1, 1, 1)]);
+    // The report reads them back, on Postgres too, where other tests' counts add to today's.
+    let numbers = ilo_server::counts::read(&server.db, today).await.unwrap();
+    assert!(
+        numbers.days[0].1 >= 3 && numbers.days[0].2 >= 1,
+        "{numbers:?}"
+    );
 }
 
 #[tokio::test]
@@ -77,7 +83,7 @@ async fn the_table_keeps_no_address_agent_or_time_of_day() {
     let server = common::start().await;
     let columns: Vec<String> = match std::env::var("ILO_TEST_DATABASE_URL") {
         Ok(_) => sqlx::query(
-            "SELECT column_name FROM information_schema.columns \
+            "SELECT column_name::text AS column_name FROM information_schema.columns \
              WHERE table_name = 'daily_counts' ORDER BY ordinal_position",
         )
         .fetch_all(&server.db)
