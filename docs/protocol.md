@@ -109,6 +109,28 @@ The labels are ASCII, without a terminator. The requester opens `S` with the sam
 | Secret, pairing id | 32 bytes of `0x33`, `example` |
 | `S` | `MIbD9AQ11WmirOWxkJoDGTitoTFomGYAyLFIQ20_tWtXiV2OFNqWo46897wVJd9I` |
 
+## Daily usage count: `/v1/daily`
+
+Each copy of ilo with Settings › Privacy › Send a Daily Usage Count on, which it is by default, posts one count per UTC day, with no credentials and no cookies:
+
+```json
+{"version":"0.1.9","channel":"release","os":"macos","os_major":26,"chip":"arm64",
+ "first":false,"daily":true,"weekly":true,"monthly":false}
+```
+
+- `channel` is `release` or `nightly`, `os` is `macos`, `windows` or `linux`, and `chip` is `arm64` or `x64`. `os_major` is macOS's major version, Windows' 10 or 11, or Linux's kernel's.
+- `first` is the copy's first run, `daily` is always true, and `weekly` and `monthly` say it's the copy's first count this ISO week and this calendar month. The copy works them out from the date of its last count, the only thing it keeps.
+- The server answers 204, and 400 or 422 to anything else, which it doesn't store. It adds one to the row for that UTC day and those fields. It keeps no ID, address, user agent or time of day, and logs nothing about the request.
+
+A day's rows add up to its daily users, the `weekly` ones in an ISO week to that week's users, the `monthly` ones in a month to that month's, and the `first` ones to new installs. A count that fails isn't sent again until the copy's next launch that day, and a day the copy missed is never sent.
+
+### Reading them: `ilo-server counts` and `GET /counts`
+
+Both show the same numbers, from one query (`counts::read`): daily users and new installs for the last 14 UTC days, weekly users for the last 8 ISO weeks and monthly users for the last 6 months, newest first. The current week and month are still filling.
+
+- `ilo-server counts` prints them from `DATABASE_URL`, without migrating it.
+- `GET /counts` shows them as a page, with a bar chart of the 14 days' users. It's HTML with its style and chart inline, no script, and a Content-Security-Policy that loads nothing. It asks for HTTP Basic auth as user `ilo` with the server's `COUNTS_PASSWORD`, compared in constant time, and answers 401 with `WWW-Authenticate: Basic` to anything else. It sends `Cache-Control: no-store` and `X-Robots-Tag: noindex`. Without `COUNTS_PASSWORD` it answers 404, as a path the server doesn't have, so a server has no page unless its owner sets one. The password goes in a header, not the URL, because proxies' logs, Railway's included, record paths.
+
 ## What the server sees
 
 The README's [What the server can see](../README.md#what-the-server-can-see) lists it. Pairing adds the names and operating systems devices give in their requests, which devices pair and when, and the commitment, public keys and sealed secret, which are of no use without the devices' private keys. A request's details are dropped when it ends. The emptied row is kept for an hour, so the limit on requests can count it.
