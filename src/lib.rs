@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod config;
+pub mod counts;
 pub mod db;
 mod jwt;
 pub mod mail;
@@ -106,6 +107,10 @@ pub fn router(state: Shared) -> Router {
             post(sync::command).layer(DefaultBodyLimit::max(sync::MAX_MESSAGE)),
         )
         .route("/relay", get(relay::connect))
+        .route(
+            "/v1/daily",
+            post(counts::daily).layer(DefaultBodyLimit::max(counts::MAX_BODY)),
+        )
         .with_state(state)
 }
 

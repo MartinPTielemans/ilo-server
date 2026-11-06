@@ -8,6 +8,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_env("LOG").unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
+    // `ilo-server counts` prints the daily usage count's numbers from DATABASE_URL, and serves
+    // nothing.
+    if std::env::args().nth(1).as_deref() == Some("counts") {
+        return print_counts().await;
+    }
     let config = Config::from_env()?;
     let mailer = Mailer::from_config(&config)?;
     if config.dev_mode {
@@ -35,5 +40,21 @@ async fn main() -> anyhow::Result<()> {
         let _ = interrupt.await;
     })
     .await?;
+    Ok(())
+}
+
+/// Daily, weekly and monthly users and new installs, from the database the server uses. It reads
+/// the counts table only, so it never migrates the database ahead of the server.
+async fn print_counts() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+    let url = std::env::var("DATABASE_URL").context("DATABASE_URL names no database")?;
+    let db = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .context("can't open the database")?;
+    let today = ilo_server::counts::today();
+    let tallies = ilo_server::counts::tallies(&db, today - ilo_server::counts::REPORT_DAYS).await?;
+    print!("{}", ilo_server::counts::report(&tallies, today));
     Ok(())
 }
