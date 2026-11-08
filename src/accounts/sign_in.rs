@@ -270,6 +270,15 @@ pub async fn email(
     let Some(email) = super::normalize_email(&form.email) else {
         return pages::email(Some(&form.email), Some("That isn't an email address."));
     };
+    // A code to a domain that takes no mail would bounce, which costs the server its mail
+    // service's trust. The address is the one typed, so a typo is the likely cause.
+    let domain = email.rsplit_once('@').map_or("", |(_, domain)| domain);
+    if !state.domains.take_mail(domain).await {
+        return pages::email(
+            Some(&form.email),
+            Some("That address can't get mail. Check it for a typo."),
+        );
+    }
     let result: anyhow::Result<Response> = async {
         // A corrected address gets its own code and its own resend.
         sqlx::query(

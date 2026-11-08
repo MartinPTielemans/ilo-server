@@ -1,6 +1,6 @@
 use anyhow::Context;
 use ilo_server::config::Config;
-use ilo_server::mail::Mailer;
+use ilo_server::mail::{Domains, Mailer};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -22,7 +22,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .with_context(|| format!("can't listen on {}:{}", address.0, address.1))?;
-    let state = ilo_server::state(config, mailer).await?;
+    // A server that mails no one has no bounces to avoid.
+    let domains = match mailer {
+        Mailer::Log => Domains::except(&[]),
+        _ => Domains::system()?,
+    };
+    let state = ilo_server::state(config, mailer, domains).await?;
     tracing::info!(address = %listener.local_addr()?, issuer = state.config.issuer(), "ilo-server is up");
     axum::serve(
         listener,
