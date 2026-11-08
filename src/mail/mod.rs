@@ -1,6 +1,9 @@
 //! Sends sign-in codes and new-sign-in notices: by SMTP, by Cloudflare Email Service's send API,
 //! or to the log in dev mode. A code goes as text and as a page with the wordmark (code.html).
 
+mod domains;
+pub use domains::Domains;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

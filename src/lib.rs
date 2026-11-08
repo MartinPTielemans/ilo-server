@@ -32,12 +32,14 @@ use webauthn_rs::{Webauthn, WebauthnBuilder};
 
 use accounts::{devices, oidc, sign_in};
 use config::Config;
-use mail::Mailer;
+use mail::{Domains, Mailer};
 
 pub struct AppState {
     pub config: Config,
     pub db: db::Db,
     pub mailer: Mailer,
+    /// Which addresses' domains can get mail, asked before a code goes to one.
+    pub domains: Domains,
     pub relay: relay::Relay,
     /// Each account's commits this minute, for SYNC_COMMITS_PER_MINUTE.
     pub commits: sync::CommitRate,
@@ -47,7 +49,7 @@ pub struct AppState {
 
 pub type Shared = Arc<AppState>;
 
-pub async fn state(config: Config, mailer: Mailer) -> anyhow::Result<Shared> {
+pub async fn state(config: Config, mailer: Mailer, domains: Domains) -> anyhow::Result<Shared> {
     let db = db::connect(&config.database_url).await?;
     let rp_id = config
         .public_url
@@ -62,6 +64,7 @@ pub async fn state(config: Config, mailer: Mailer) -> anyhow::Result<Shared> {
         config,
         db,
         mailer,
+        domains,
         relay: relay::Relay::default(),
         commits: sync::CommitRate::default(),
         webauthn,

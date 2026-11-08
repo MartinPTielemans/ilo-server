@@ -147,6 +147,46 @@ async fn a_send_api_that_fails_gets_the_page_an_smtp_failure_does() {
 }
 
 #[tokio::test]
+async fn an_address_whose_domain_takes_no_mail_gets_no_code_and_the_corrected_one_does() {
+    let server = start().await;
+    let browser = browser();
+    browser
+        .get(server.authorize_url(&pkce(), "s"))
+        .send()
+        .await
+        .unwrap();
+    let typed = format!("someone@{NO_MAIL}");
+    let page = browser
+        .post(format!("{}/authorize/email", server.url))
+        .form(&[("email", &typed)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("That address can&#39;t get mail."), "{page}");
+    // The page keeps what was typed, to correct.
+    assert!(page.contains(&typed), "{page}");
+    assert!(server.mail.lock().unwrap().is_empty());
+
+    let corrected = unique_email("corrected");
+    let page = browser
+        .post(format!("{}/authorize/email", server.url))
+        .form(&[("email", &corrected)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Check your email"), "{page}");
+    let mail = server.mail.lock().unwrap();
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0].to, corrected);
+}
+
+#[tokio::test]
 async fn a_wrong_code_is_refused_and_counts_against_the_limit() {
     let server = start().await;
     let email = unique_email("wrong");
@@ -880,9 +920,13 @@ async fn a_restarted_server_keeps_its_signing_key() {
     };
     let mut keys = Vec::new();
     for _ in 0..2 {
-        let state = ilo_server::state(config(), ilo_server::mail::Mailer::Log)
-            .await
-            .unwrap();
+        let state = ilo_server::state(
+            config(),
+            ilo_server::mail::Mailer::Log,
+            ilo_server::mail::Domains::except(&[]),
+        )
+        .await
+        .unwrap();
         let rows: Vec<String> = sqlx::query_scalar("SELECT id FROM signing_keys")
             .fetch_all(&state.db)
             .await

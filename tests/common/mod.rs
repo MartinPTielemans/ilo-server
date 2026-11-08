@@ -11,7 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt, StreamExt};
 use ilo_server::config::Config;
-use ilo_server::mail::{Mail, Mailer};
+use ilo_server::mail::{Domains, Mail, Mailer};
 use ilo_server::pb;
 use prost::Message as _;
 use reqwest::redirect::Policy;
@@ -20,6 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 pub const REDIRECT: &str = "http://127.0.0.1:47123/callback";
+/// A domain the test server takes as getting no mail.
+pub const NO_MAIL: &str = "no-mail.example.org";
 
 pub struct Server {
     pub url: String,
@@ -92,7 +94,8 @@ async fn serve(mailer: Mailer, vars: &[(&str, &str)], shared: bool) -> Server {
         _ => None,
     })
     .unwrap();
-    let state = ilo_server::state(config, mailer).await.unwrap();
+    let domains = Domains::except(&[NO_MAIL]);
+    let state = ilo_server::state(config, mailer, domains).await.unwrap();
     let db = state.db.clone();
     tokio::spawn(async move {
         axum::serve(
