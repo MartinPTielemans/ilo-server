@@ -52,3 +52,58 @@ jobs:
           done
           docker logs server
           exit 1
+
+  # The README's Docker Compose setup, the server and Postgres, as a self-hoster starts it, and one
+  # sign-in against it: the code from the log, as DEV_MODE writes it, traded for tokens that name
+  # the address. A throwaway address, as DEV_MODE mails no one.
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start it as the README says
+        run: |
+          cp .env.example .env
+          sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|; s|^DEV_MODE=.*|DEV_MODE=1|" .env
+          docker compose up -d --build
+          for _ in $(seq 60); do
+            [ "$(curl -fsS http://localhost:8080/health)" = ok ] && exit 0
+            sleep 1
+          done
+          docker compose logs
+          exit 1
+      - name: One sign-in
+        run: |
+          url=http://localhost:8080
+          email=compose-check@example.org
+          redirect=http://127.0.0.1:47123/callback
+          jar=$RUNNER_TEMP/cookies
+          verifier=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')
+          challenge=$(printf %s "$verifier" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          curl -fsS -c "$jar" -o /dev/null -G "$url/authorize" \
+            --data-urlencode response_type=code --data-urlencode client_id=ilo \
+            --data-urlencode "redirect_uri=$redirect" --data-urlencode "scope=openid email offline_access" \
+            --data-urlencode state=compose --data-urlencode nonce=compose \
+            --data-urlencode "code_challenge=$challenge" --data-urlencode code_challenge_method=S256
+          curl -fsS -b "$jar" -c "$jar" --data-urlencode "email=$email" "$url/authorize/email" |
+            grep -q 'Check your email'
+          code=$(docker compose logs server | grep -o '[0-9]\{6\} is your ilo sign-in code' | tail -1 | cut -c1-6)
+          [ -n "$code" ] || { docker compose logs server; echo "::error::no sign-in code in the log"; exit 1; }
+          # A first sign-in offers a passkey, which "Not now" passes.
+          status=$(curl -sS -b "$jar" -c "$jar" -o "$RUNNER_TEMP/page" -w '%{http_code}' --data "code=$code" "$url/authorize/code")
+          if [ "$status" = 200 ]; then
+            grep -q 'Add a passkey' "$RUNNER_TEMP/page"
+            status=$(curl -sS -b "$jar" -c "$jar" -o /dev/null -w '%{http_code}' -X POST "$url/authorize/continue")
+          fi
+          [ "$status" = 303 ] || { cat "$RUNNER_TEMP/page"; echo "::error::the code didn't finish the sign-in"; exit 1; }
+          back=$(curl -fsS -b "$jar" "$url/authorize/done" | sed -n 's/.*http-equiv="refresh" content="1; url=\([^"]*\)".*/\1/p' | sed 's/&amp;/\&/g')
+          case $back in "$redirect?"*) ;; *) echo "::error::the done page sent the tab to '$back'"; exit 1 ;; esac
+          grant=$(printf %s "$back" | tr '?&' '\n\n' | sed -n 's/^code=//p')
+          tokens=$(curl -fsS "$url/token" --data grant_type=authorization_code --data-urlencode "code=$grant" \
+            --data-urlencode "redirect_uri=$redirect" --data client_id=ilo \
+            --data-urlencode "code_verifier=$verifier" --data-urlencode "device_name=Compose check")
+          access=$(printf %s "$tokens" | jq -er .access_token)
+          printf %s "$tokens" | jq -e '.refresh_token and .id_token' > /dev/null
+          curl -fsS -H "Authorization: Bearer $access" "$url/userinfo" | jq -e --arg email "$email" '.email == $email'
+          curl -fsS -H "Authorization: Bearer $access" "$url/api/devices" | jq -e '[.devices[] | select(.current)] | length == 1'
+      - if: ${{ always() }}
+        run: docker compose down -v
