@@ -124,6 +124,8 @@ Each copy of ilo with Settings › Privacy › Send a Daily Usage Count on, whic
 
 A day's rows add up to its daily users, the `weekly` ones in an ISO week to that week's users, the `monthly` ones in a month to that month's, and the `first` ones to new installs. A count that fails isn't sent again until the copy's next launch that day, and a day the copy missed is never sent.
 
+Automated launches send no count, or every CI run that starts a fresh profile would be counted as a new install. ilo's checks put a `no-daily-count` file in each launch's profile before its first launch. It's the file Settings leaves when the count is off, and every release since 0.1.10 honours it. A launch can also be given `--daily-count-url=`, with no value, which sends to no server. A check fails if its log says `daily count sent` and the run started no count server of its own (`count_off` and `counted_nowhere` in ilo's `app/check/lib.sh`). A fork's CI that launches its builds needs the same.
+
 ### Reading them: `ilo-server counts` and `GET /counts`
 
 Both show the same numbers, from one query (`counts::read`): daily users and new installs for the last 14 UTC days, weekly users for the last 8 ISO weeks and monthly users for the last 6 months, newest first. The current week and month are still filling.
