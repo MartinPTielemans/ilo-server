@@ -240,6 +240,14 @@ async fn the_counts_page_shows_what_the_command_prints() {
         let row = format!("<th scope=\"row\">{label}</th><td>{users}</td>");
         assert!(html.contains(&row), "no {row} in the page");
     }
+    // Today broken down by kind: this test's copies are one, macOS 26 on arm64. On a shared
+    // Postgres other tests' copies are other versions, so they're rows of their own.
+    let row = format!(
+        "<tr><th scope=\"row\">macOS 26</th><td>arm64</td><td>{version}</td><td>release</td>\
+         <td class=\"n\">3</td><td class=\"n\">1</td></tr>"
+    );
+    assert!(html.contains(&row), "no {row} in the page");
+
     // And each of the command's lines has its row, so the two can't show different days.
     let text = numbers.text();
     let lines: Vec<&str> = text.lines().filter(|line| line.starts_with("  ")).collect();
