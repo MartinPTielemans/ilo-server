@@ -6,7 +6,8 @@
 //! The rows give the numbers: a day's counts are its daily users, the counts flagged `weekly` in an
 //! ISO week its weekly users, those flagged `monthly` in a month its monthly users, and those
 //! flagged `first` new installs. `ilo-server counts` prints them, and `GET /counts` shows them to
-//! whoever has `COUNTS_PASSWORD` (`counts_page.rs`).
+//! whoever has `COUNTS_PASSWORD` (`counts_page.rs`), with each day broken down by the kind of copy
+//! that counted: its system, chip, version and channel.
 
 use std::collections::BTreeMap;
 
@@ -86,10 +87,21 @@ pub async fn daily(State(state): State<Shared>, Json(count): Json<Count>) -> Sta
 
 const DAY: i64 = 24 * 60 * 60;
 
+/// What a count says of the copy that sent it, besides its flags.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Kind {
+    pub os: String,
+    pub os_major: i64,
+    pub chip: String,
+    pub version: String,
+    pub channel: String,
+}
+
 /// One row of `daily_counts`, as the report reads it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tally {
     pub day: i64,
+    pub kind: Kind,
     pub first: bool,
     pub weekly: bool,
     pub monthly: bool,
@@ -99,7 +111,8 @@ pub struct Tally {
 /// The rows from `since`, a day number, on.
 pub async fn tallies(db: &crate::db::Db, since: i64) -> anyhow::Result<Vec<Tally>> {
     let rows = sqlx::query(
-        "SELECT day, first_run, weekly, monthly, count FROM daily_counts WHERE day >= $1",
+        "SELECT day, os, os_major, chip, version, channel, first_run, weekly, monthly, count \
+         FROM daily_counts WHERE day >= $1",
     )
     .bind(since)
     .fetch_all(db)
@@ -108,6 +121,13 @@ pub async fn tallies(db: &crate::db::Db, since: i64) -> anyhow::Result<Vec<Tally
         .map(|row| {
             Ok(Tally {
                 day: row.try_get("day")?,
+                kind: Kind {
+                    os: row.try_get("os")?,
+                    os_major: row.try_get("os_major")?,
+                    chip: row.try_get("chip")?,
+                    version: row.try_get("version")?,
+                    channel: row.try_get("channel")?,
+                },
                 first: row.try_get::<i64, _>("first_run")? != 0,
                 weekly: row.try_get::<i64, _>("weekly")? != 0,
                 monthly: row.try_get::<i64, _>("monthly")? != 0,
@@ -128,7 +148,7 @@ pub fn today() -> i64 {
 /// The numbers `ilo-server counts` prints and `GET /counts` shows, for the days up to a day:
 /// daily users and new installs for the last 14 days, weekly users for the last 8 ISO weeks, and
 /// monthly users for the last 6 months, each newest first. The current week and month are still
-/// filling.
+/// filling. The page also breaks each of the 14 days down by kind of copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Numbers {
     /// `YYYY-MM-DD`, users, new installs.
@@ -137,6 +157,9 @@ pub struct Numbers {
     pub weeks: Vec<(String, i64)>,
     /// `YYYY-MM`, users.
     pub months: Vec<(String, i64)>,
+    /// The same days as `days`: each kind of copy that counted on it, with its users and new
+    /// installs, most users first.
+    pub kinds: Vec<Vec<(Kind, i64, i64)>>,
 }
 
 /// The numbers for the days up to `today`, from the database: the one query the command and the
@@ -150,6 +173,7 @@ pub fn numbers(tallies: &[Tally], today: i64) -> Numbers {
     let mut days: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
     let mut weeks: BTreeMap<i64, i64> = BTreeMap::new();
     let mut months: BTreeMap<(i64, u32), i64> = BTreeMap::new();
+    let mut kinds: BTreeMap<i64, BTreeMap<&Kind, (i64, i64)>> = BTreeMap::new();
     for day in today - 13..=today {
         days.insert(day, (0, 0));
     }
@@ -167,8 +191,13 @@ pub fn numbers(tallies: &[Tally], today: i64) -> Numbers {
     }
     for tally in tallies {
         if let Some((users, new)) = days.get_mut(&tally.day) {
+            let first = if tally.first { tally.count } else { 0 };
             *users += tally.count;
-            *new += if tally.first { tally.count } else { 0 };
+            *new += first;
+            let kind = kinds.entry(tally.day).or_default();
+            let (users, new) = kind.entry(&tally.kind).or_default();
+            *users += tally.count;
+            *new += first;
         }
         if tally.weekly
             && let Some(users) = weeks.get_mut(&monday(tally.day))
@@ -181,7 +210,17 @@ pub fn numbers(tallies: &[Tally], today: i64) -> Numbers {
             *users += tally.count;
         }
     }
+    let kinds = (days.keys().rev())
+        .map(|day| {
+            let mut list: Vec<(Kind, i64, i64)> = (kinds.get(day).into_iter().flatten())
+                .map(|(kind, (users, new))| ((*kind).clone(), *users, *new))
+                .collect();
+            list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            list
+        })
+        .collect();
     Numbers {
+        kinds,
         days: (days.iter().rev())
             .map(|(day, (users, new))| {
                 let (year, month, date) = civil(*day);
@@ -270,6 +309,7 @@ mod tests {
     fn tally(day: i64, first: bool, weekly: bool, monthly: bool, count: i64) -> Tally {
         Tally {
             day,
+            kind: Kind::default(),
             first,
             weekly,
             monthly,
@@ -325,6 +365,43 @@ mod tests {
         assert_eq!(line("2026-10 "), ["2"]);
         // 14 days, 8 weeks, 6 months and three headings.
         assert_eq!(report.lines().count(), 14 + 8 + 6 + 3);
+    }
+
+    #[test]
+    fn each_day_is_broken_down_by_kind_of_copy() {
+        let today = days_from_civil(2026, 11, 9);
+        let kind = |os: &str, version: &str| Kind {
+            os: os.into(),
+            os_major: 6,
+            chip: "x64".into(),
+            version: version.into(),
+            channel: "release".into(),
+        };
+        let row = |day, kind: Kind, first, count| Tally {
+            kind,
+            ..tally(day, first, false, false, count)
+        };
+        let tallies = [
+            row(today, kind("linux", "0.1.12"), true, 9),
+            row(today, kind("linux", "0.1.12"), false, 2),
+            row(today, kind("macos", "0.1.13"), false, 3),
+            row(today - 1, kind("macos", "0.1.13"), true, 1),
+            // Before the 14 days: in no day's breakdown.
+            row(today - 14, kind("windows", "0.1.9"), false, 5),
+        ];
+        let numbers = numbers(&tallies, today);
+        assert_eq!(numbers.kinds.len(), numbers.days.len());
+        // A kind's rows add up, the most users first, and a day's kinds add up to its users.
+        assert_eq!(
+            numbers.kinds[0],
+            [
+                (kind("linux", "0.1.12"), 11, 9),
+                (kind("macos", "0.1.13"), 3, 0)
+            ]
+        );
+        assert_eq!(numbers.days[0].1, 14);
+        assert_eq!(numbers.kinds[1], [(kind("macos", "0.1.13"), 1, 1)]);
+        assert!(numbers.kinds[2..].iter().all(Vec::is_empty));
     }
 
     #[test]

@@ -75,7 +75,9 @@ fn authorized(headers: &HeaderMap, password: &str) -> bool {
     )
 }
 
-/// The page, from the numbers alone: every value in it is a date or a number the server made.
+/// The page, from the numbers alone: every value in it is a date or a number the server made, or a
+/// field of a count, which the endpoint took only from the values ilo sends and the page escapes
+/// all the same.
 pub fn html(numbers: &Numbers) -> axum::response::Html<String> {
     let today = numbers.days.first().map_or(0, |(_, users, _)| *users);
     let week = numbers.weeks.first().map_or(0, |(_, users)| *users);
@@ -92,6 +94,7 @@ pub fn html(numbers: &Numbers) -> axum::response::Html<String> {
             .collect::<String>()
     };
     let (weeks, months) = (rows(&numbers.weeks), rows(&numbers.months));
+    let kinds = kinds(numbers);
     let chart = chart(numbers);
     axum::response::Html(format!(
         r#"<!doctype html>
@@ -130,6 +133,13 @@ th, td {{ padding: 6px 0; border-bottom: 1px solid var(--line); text-align: righ
 th[scope="row"] {{ text-align: left; font-weight: normal; }}
 thead th {{ color: var(--muted); font-weight: 500; font-size: 0.8125rem; }}
 thead th:first-child {{ text-align: left; }}
+.kinds td, .kinds thead th {{ text-align: left; }}
+.kinds .n, .kinds thead .n {{ text-align: right; }}
+details {{ border-bottom: 1px solid var(--line); }}
+summary {{ padding: 6px 0; cursor: pointer; font-variant-numeric: tabular-nums; }}
+summary span {{ color: var(--muted); }}
+details table {{ margin: 0 0 12px; }}
+details tr:last-child > * {{ border-bottom: 0; }}
 </style>
 </head>
 <body>
@@ -148,7 +158,8 @@ thead th:first-child {{ text-align: left; }}
 <tbody>
 {days}</tbody>
 </table>
-<h2>Weekly users</h2>
+<h2>Each day by system, chip, version and channel</h2>
+{kinds}<h2>Weekly users</h2>
 <table>
 <thead><tr><th scope="col">ISO week</th><th scope="col">Users</th></tr></thead>
 <tbody>
@@ -165,6 +176,53 @@ thead th:first-child {{ text-align: left; }}
 </html>
 "#
     ))
+}
+
+/// Each of the 14 days that had counts, newest first and open, as the kinds of copy that counted
+/// on it, so a day's users can be told apart: a release's, a nightly's, one system's.
+fn kinds(numbers: &Numbers) -> String {
+    let mut out = String::new();
+    let days = numbers.days.iter().zip(&numbers.kinds);
+    for ((day, users, new), kinds) in days.filter(|(_, kinds)| !kinds.is_empty()) {
+        let open = if out.is_empty() { " open" } else { "" };
+        let people = if *users == 1 { "user" } else { "users" };
+        out += &format!(
+            "<details{open}><summary>{day} <span>{users} {people}, {new} new</span></summary>\n\
+             <table class=\"kinds\">\n<thead><tr><th scope=\"col\">System</th>\
+             <th scope=\"col\">Chip</th><th scope=\"col\">Version</th>\
+             <th scope=\"col\">Channel</th><th scope=\"col\" class=\"n\">Users</th>\
+             <th scope=\"col\" class=\"n\">New</th></tr></thead>\n<tbody>\n"
+        );
+        for (kind, users, new) in kinds {
+            let system = match kind.os.as_str() {
+                "macos" => "macOS",
+                "windows" => "Windows",
+                "linux" => "Linux",
+                other => other,
+            };
+            out += &format!(
+                "<tr><th scope=\"row\">{} {}</th><td>{}</td><td>{}</td><td>{}</td>\
+                 <td class=\"n\">{users}</td><td class=\"n\">{new}</td></tr>\n",
+                escape(system),
+                kind.os_major,
+                escape(&kind.chip),
+                escape(&kind.version),
+                escape(&kind.channel),
+            );
+        }
+        out += "</tbody>\n</table>\n</details>\n";
+    }
+    if out.is_empty() {
+        out = "<p>No counts in the last 14 days.</p>\n".into();
+    }
+    out
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// A bar a day for the last 14, oldest on the left, each with its number as its title.
@@ -230,6 +288,30 @@ mod tests {
         assert!(!authorized(&bearer, "right"));
         // A password with a colon is the rest of the credentials.
         assert!(authorized(&basic("ilo:a:b"), "a:b"));
+    }
+
+    #[test]
+    fn a_day_is_broken_down_by_kind_and_a_day_without_counts_is_left_out() {
+        let mut numbers = counts::numbers(&[], 20_766);
+        assert!(kinds(&numbers).contains("No counts in the last 14 days."));
+        let kind = |os: &str, version: &str| counts::Kind {
+            os: os.into(),
+            os_major: 6,
+            chip: "x64".into(),
+            version: version.into(),
+            channel: "release".into(),
+        };
+        numbers.kinds[0] = vec![(kind("linux", "0.1.12"), 11, 11)];
+        numbers.kinds[2] = vec![(kind("<b>", "0.1.13"), 1, 0)];
+        let html = kinds(&numbers);
+        assert_eq!(html.matches("<details").count(), 2);
+        assert_eq!(html.matches("<details open>").count(), 1);
+        assert!(html.contains(
+            "<tr><th scope=\"row\">Linux 6</th><td>x64</td><td>0.1.12</td><td>release</td>\
+             <td class=\"n\">11</td><td class=\"n\">11</td></tr>"
+        ));
+        assert!(html.contains("&lt;b&gt; 6"));
+        assert!(!html.contains("<b>"));
     }
 
     #[test]
