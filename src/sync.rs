@@ -10,7 +10,7 @@
 //! whether it is, and for passwords, which Chromium encrypts inside their own
 //! field, the field numbers one level down.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -298,6 +298,10 @@ pub async fn handle(
         .filter(|birthday| !birthday.is_empty());
     if sent_birthday.is_some_and(|birthday| birthday != store.birthday) {
         // The data was cleared since this client last synced.
+        tracing::info!(
+            device = short(&device.id),
+            "told a device its sync data was cleared, so it starts over"
+        );
         response.set_error_code(ErrorType::NotMyBirthday);
         response.store_birthday = Some(store.birthday);
         return Ok(Handled { response, changed });
@@ -316,12 +320,26 @@ pub async fn handle(
                 Ok(()) => None,
             };
             if let Some(wait) = wait {
-                tracing::info!(wait = wait.as_secs(), "throttled an account's commit");
+                tracing::info!(
+                    device = short(&device.id),
+                    wait = wait.as_secs(),
+                    "throttled an account's commit"
+                );
                 throttled(&mut response, wait);
                 response.store_birthday = Some(birthday);
                 return Ok(Handled { response, changed });
             }
             let (commit, types) = commit(db, account, &request).await?;
+            // Chromium counts a refused item as a failed commit and shows sync in trouble, while
+            // the HTTP answer is still 200, so this line is the only place a refusal shows.
+            let refused = refusals(&request.entries, &commit.entryresponse);
+            if !refused.is_empty() {
+                tracing::warn!(
+                    device = short(&device.id),
+                    refused,
+                    "refused items of a commit"
+                );
+            }
             response.commit = Some(commit);
             changed = (!types.is_empty()).then_some(types);
         }
@@ -703,6 +721,44 @@ async fn commit(
     Ok((response, changed))
 }
 
+/// A device as the log names it: enough of its id to tell an account's devices apart and find
+/// the device in the database, without a whole id in every line.
+fn short(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// The items a commit refused, counted by data type and reason, such as
+/// "2 of type 1239418: CONFLICT, the server has a newer version", or "" if it took them all.
+/// The data type is the specifics' field number, as Chromium's sync-internals lists them.
+fn refusals(entries: &[SyncEntity], responses: &[commit_response::EntryResponse]) -> String {
+    use commit_response::ResponseType::Success;
+    let mut counts: BTreeMap<(Option<i32>, &str, &str), usize> = BTreeMap::new();
+    for (entry, response) in entries.iter().zip(responses) {
+        if response.response_type() == Success {
+            continue;
+        }
+        let data_type = entry
+            .specifics
+            .as_deref()
+            .and_then(data_type_of)
+            .or_else(|| data_type_of_id(entry.id_string()));
+        let reason = (
+            data_type,
+            response.response_type().as_str_name(),
+            response.error_message(),
+        );
+        *counts.entry(reason).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((data_type, kind, message), count)| {
+            let data_type = data_type.map_or("unknown type".to_owned(), |t| format!("type {t}"));
+            format!("{count} of {data_type}: {kind}, {message}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn refused(kind: commit_response::ResponseType, message: &str) -> commit_response::EntryResponse {
     let mut response = commit_response::EntryResponse {
         error_message: Some(message.into()),
@@ -746,7 +802,6 @@ async fn commit_entry(
             && unnamed(entry.name.as_deref())
             && unnamed(entry.non_unique_name.as_deref()))
     {
-        tracing::warn!(data_type, "refused an item that isn't encrypted");
         return Ok((
             refused(InvalidMessage, "this data type is kept only encrypted"),
             None,
@@ -936,6 +991,38 @@ async fn clear(db: &Db, account: &str, store: &Store) -> anyhow::Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commit_names_what_it_refused_by_type_and_reason() {
+        use commit_response::ResponseType::{Conflict, InvalidMessage, Success};
+        let entry = |data_type: i32| SyncEntity {
+            specifics: Some(empty_specifics(data_type)),
+            ..Default::default()
+        };
+        let newer = || refused(Conflict, "the server has a newer version");
+        let mut taken = commit_response::EntryResponse::default();
+        taken.set_response_type(Success);
+        let entries = [
+            entry(BOOKMARKS),
+            entry(BOOKMARKS),
+            entry(BOOKMARKS),
+            entry(NIGORI),
+        ];
+        let responses = [
+            newer(),
+            taken.clone(),
+            newer(),
+            refused(InvalidMessage, "Nigori can't be deleted"),
+        ];
+        assert_eq!(
+            refusals(&entries, &responses),
+            format!(
+                "2 of type {BOOKMARKS}: CONFLICT, the server has a newer version; \
+                 1 of type {NIGORI}: INVALID_MESSAGE, Nigori can't be deleted"
+            )
+        );
+        assert_eq!(refusals(&entries[..2], &[taken.clone(), taken]), "");
+    }
 
     #[test]
     fn the_data_type_is_the_first_field_besides_encrypted() {
