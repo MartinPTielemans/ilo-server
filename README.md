@@ -19,7 +19,7 @@ ilo turns on a custom passphrase before it first syncs, so Chromium encrypts eac
 - **The relay:** which of an account's devices message each other, when, and how large the messages are. Not what they say. Adding a device also shows the name and operating system it gives, and keys and a sealed passphrase that the server can't open.
 - **The daily usage count:** how many copies of ilo sent their count each UTC day, by version, channel, operating system and its major version, and chip, and how many of those were a copy's first run or its first count that week or month. A count has no ID, and the server keeps the numbers only: never the address a count came from, its user agent or the time of day.
 - **The network:** like any web server, the addresses requests come from and when. This server doesn't log them, but a proxy in front of it may.
-- **Its log:** when the server refuses a commit's items, throttles a device or tells it to start over, a line with the first characters of that device's id, the data types and the reason, so a device stuck in sync trouble can be told why. Never an address, an email or an item's contents.
+- **Its log:** a line naming a device by the first characters of its id when the server refuses items of its commit (with each item's data type and the reason), throttles it (with the wait) or tells it its sync data was cleared, so a device stuck in sync trouble can be told why. Never an address, an email or an item's contents.
 
 The server refuses an item that arrives unencrypted, for every type Chromium encrypts under a passphrase, so a client that hasn't set one, an unmodified Chromium included, can't sync those types here.
 
