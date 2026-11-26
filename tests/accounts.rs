@@ -1060,7 +1060,7 @@ async fn google_asks_for_the_mailed_code_before_linking_an_address_it_doesnt_hol
             .text()
             .await
             .unwrap();
-        assert!(page.contains("To sign in with Google"), "{page}");
+        assert!(page.contains("To use Google sign-in"), "{page}");
         pages.push(page.replace(&person.email, "ADDRESS"));
         assert_eq!(
             linked_account(&server, &person).await,
@@ -1369,12 +1369,7 @@ async fn a_linked_google_sign_in_is_listed_and_removed_and_then_needs_the_mailed
     let at_google = to_google(&server, &browser, &pkce).await;
     let page = from_google(&browser, google.sign_in(&at_google, &person)).await;
     assert_eq!(page.status(), 200);
-    assert!(
-        page.text()
-            .await
-            .unwrap()
-            .contains("To sign in with Google")
-    );
+    assert!(page.text().await.unwrap().contains("To use Google sign-in"));
     assert_eq!(linked_account(&server, &person).await, None);
 
     // The mailed code still signs in, from another tab.

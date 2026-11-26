@@ -134,7 +134,7 @@ pub fn code(sent: Code) -> Response {
 </form>
 {resend}"#,
             if sent.linking {
-                "To sign in with Google from now on, enter the 6-digit code we sent to"
+                "To use Google sign-in, enter the 6-digit code we sent to"
             } else {
                 "We sent a 6-digit code to"
             },

@@ -721,7 +721,7 @@ pub async fn google_answer(
         }
         let Some(code) = answer.code.filter(|_| answer.error.is_none()) else {
             return back(if answer.error.as_deref() == Some("access_denied") {
-                "Signing in with Google was cancelled."
+                "Google sign-in was cancelled."
             } else {
                 DIDNT_FINISH
             });
@@ -734,7 +734,7 @@ pub async fn google_answer(
         let identity = match google::exchange(&state.http, &state.config, google, &code, &leg).await {
             Ok(identity) => identity,
             Err(Refused::Unverified) => {
-                return back("Google hasn't verified your Google account's address. Enter it here for a code instead.");
+                return back("Google hasn't verified that email address. Enter it here to get a code instead.");
             }
             Err(Refused::Failed) => return back(DIDNT_FINISH),
         };
@@ -759,7 +759,7 @@ pub async fn google_answer(
     result.unwrap_or_else(internal)
 }
 
-const DIDNT_FINISH: &str = "Signing in with Google didn't finish. Try again.";
+const DIDNT_FINISH: &str = "Google sign-in didn't finish. Try again.";
 
 /// The account a Google account signs in to: the one its `sub` is linked to, else the
 /// address's, made if it has none, where Google holds the address's mailbox and the account
