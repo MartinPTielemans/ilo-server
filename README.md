@@ -106,7 +106,8 @@ Then check that `/health` says `ok`.
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | Where it listens. |
 | `LOG` | `info` | Log filter, such as `debug` or `ilo_server=debug`. |
 | `COUNTS_PASSWORD` | | The password `GET /counts` asks for, as user `ilo`, to show the daily usage count's numbers. Unset, there's no page: `/counts` answers 404. Use a long random one: it's the page's only guard. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | A Google OAuth client of type Web application, with `$PUBLIC_URL/authorize/google` as its one redirect URI. With both, the sign-in pages offer Continue with Google; with neither, there's no Google road. One without the other stops the server at start. It asks Google for `openid email` only, and keeps the Google account's id and no Google token. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | A Google OAuth client of type Web application, with `$PUBLIC_URL/authorize/google` as its redirect URI. With both, the server is Google's client; with neither, there's no Google road. One without the other stops the server at start. It asks Google for `openid email` only, and keeps the Google account's id and no Google token. |
+| `GOOGLE_OFFERED` | `false` | `true` or `1` offers the Google road: the sign-in pages' Continue with Google, discovery's `ilo_google` and `/authorize`'s `provider=google`. Off, the server offers none of them, as with no client, so a client still in Google's testing mode, which only its test users can finish, is offered to no one. A sign-in already at Google still comes back. Needs the client. |
 | `GOOGLE_TEST_URL` | | For tests only, and refused outside `DEV_MODE`: a stand-in Google, whose `/auth` and `/token` take the place of Google's and which signs the ID tokens. |
 
 ## Endpoints

@@ -34,7 +34,7 @@ pub async fn discovery(State(state): State<Shared>) -> Json<Value> {
         "authorization_response_iss_parameter_supported": true,
     });
     // Not OIDC's: `/authorize` takes `provider=google`, and its page offers Google.
-    if config.google.is_some() {
+    if config.offered_google().is_some() {
         discovery["ilo_google"] = json!(true);
     }
     Json(discovery)

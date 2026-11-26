@@ -173,8 +173,9 @@ pub async fn authorize(
         header::SET_COOKIE,
         cookie(&state.config, &id, SIGN_IN_LIFETIME),
     )];
-    // Without a Google client, the parameter is ignored and the page shows its other roads.
-    if params.provider.as_deref() == Some(google::PROVIDER) && state.config.google.is_some() {
+    // Without a Google client offered, the parameter is ignored and the page shows its other
+    // roads.
+    if params.provider.as_deref() == Some(google::PROVIDER) && has_google(&state) {
         return match to_google(&state, &id).await {
             Ok(response) => (set_cookie, response).into_response(),
             Err(error) => internal(error),
@@ -187,8 +188,9 @@ pub async fn authorize(
         .into_response()
 }
 
+/// The server offers its Google road (`GOOGLE_OFFERED`).
 fn has_google(state: &Shared) -> bool {
-    state.config.google.is_some()
+    state.config.offered_google().is_some()
 }
 
 async fn start(

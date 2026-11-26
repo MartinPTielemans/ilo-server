@@ -31,6 +31,10 @@ pub struct Config {
     /// `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, the server's own client at Google, for
     /// signing in with Google. Without them there's no Google road.
     pub google: Option<Google>,
+    /// `GOOGLE_OFFERED`: the pages, discovery and `provider=google` offer the Google road. Off
+    /// by default, so a client Google still has in testing, which only its listed test users can
+    /// finish, is offered to no one. Off, a trip already at Google still comes back.
+    pub google_offered: bool,
 }
 
 /// Google as the sign-in pages' other provider, with the server as its client.
@@ -197,6 +201,14 @@ impl Config {
             (None, None) => None,
             _ => bail!("set both GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET, or neither"),
         };
+        let google_offered = match var("GOOGLE_OFFERED").as_deref() {
+            None | Some("0" | "false") => false,
+            Some("1" | "true") => true,
+            Some(_) => bail!("GOOGLE_OFFERED is 1 or true to offer Google, else 0 or false"),
+        };
+        if google_offered && google.is_none() {
+            bail!("GOOGLE_OFFERED needs GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET");
+        }
         Ok(Self {
             host: var("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port,
@@ -222,7 +234,13 @@ impl Config {
             },
             counts_password: var("COUNTS_PASSWORD").map(Password),
             google,
+            google_offered,
         })
+    }
+
+    /// The Google client, while the server offers its road.
+    pub fn offered_google(&self) -> Option<&Google> {
+        self.google.as_ref().filter(|_| self.google_offered)
     }
 
     /// The issuer, without a trailing slash, as OIDC compares it byte for byte.
@@ -337,6 +355,28 @@ mod tests {
         let error = production(&[&google[..], &[("SMTP_URL", "smtps://m.example.org")]].concat())
             .unwrap_err();
         assert!(error.to_string().contains("GOOGLE_TEST_URL"));
+    }
+
+    #[test]
+    fn google_is_offered_only_when_the_server_says_so() {
+        let google = [
+            ("DEV_MODE", "1"),
+            ("GOOGLE_CLIENT_ID", "id"),
+            ("GOOGLE_CLIENT_SECRET", "secret"),
+        ];
+        let set = config(&google).unwrap();
+        assert!(
+            set.google.is_some() && set.offered_google().is_none(),
+            "off by default"
+        );
+        for (value, offered) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let set = config(&[&google[..], &[("GOOGLE_OFFERED", value)]].concat()).unwrap();
+            assert_eq!(set.offered_google().is_some(), offered, "{value}");
+        }
+        let error = config(&[&google[..], &[("GOOGLE_OFFERED", "yes")]].concat()).unwrap_err();
+        assert!(error.to_string().contains("GOOGLE_OFFERED"));
+        let error = config(&[("DEV_MODE", "1"), ("GOOGLE_OFFERED", "1")]).unwrap_err();
+        assert!(error.to_string().contains("GOOGLE_CLIENT_ID"));
     }
 
     #[test]

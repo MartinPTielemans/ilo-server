@@ -1251,32 +1251,37 @@ async fn a_server_says_whether_it_has_a_google_road() {
             .unwrap()
     }
     let button = r#"href="/authorize/google/start""#;
+    // A server that offers no Google road: no ilo_google, provider ignored, and no button.
+    async fn no_road(server: &Server, button: &str, why: &str) {
+        assert_eq!(discovery(server).await.get("ilo_google"), None, "{why}");
+        let browser = browser();
+        let page = browser
+            .get(server.authorize_url(&pkce(), "s") + "&provider=google")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 200, "{why}: provider is ignored");
+        let page = page.text().await.unwrap();
+        assert!(
+            page.contains("Sign in to ilo") && !page.contains("Google"),
+            "{why}: {page}"
+        );
+        let page = browser
+            .get(format!("{}/authorize/google/start", server.url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!page.contains(button), "{why}: {page}");
+    }
 
-    let plain = start().await;
-    assert_eq!(discovery(&plain).await.get("ilo_google"), None);
-    let browser = browser();
-    let page = browser
-        .get(plain.authorize_url(&pkce(), "s") + "&provider=google")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(page.status(), 200, "provider is ignored");
-    let page = page.text().await.unwrap();
-    assert!(
-        page.contains("Sign in to ilo") && !page.contains("Google"),
-        "{page}"
-    );
-    let page = browser
-        .get(format!("{}/authorize/google/start", plain.url))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(!page.contains(button), "{page}");
-
+    no_road(&start().await, button, "no Google client").await;
     let google = google::Google::start().await;
+    let unoffered = start_with_vars(&google.client_vars()).await;
+    no_road(&unoffered, button, "a Google client not offered yet").await;
+
     let server = start_with_google(&google).await;
     assert_eq!(discovery(&server).await["ilo_google"], true);
     let browser = common::browser();

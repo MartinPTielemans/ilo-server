@@ -56,10 +56,16 @@ pub async fn start_with(mailer: Mailer) -> Server {
     serve(mailer, &[], true).await
 }
 
-/// A server that is `google`'s client, as one with `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+/// A server that is `google`'s client and offers its road, as one with `GOOGLE_CLIENT_ID`,
+/// `GOOGLE_CLIENT_SECRET` and `GOOGLE_OFFERED`.
 pub async fn start_with_google(google: &google::Google) -> Server {
+    start_with_vars(&google.vars()).await
+}
+
+/// A server with `vars` over the tests' settings.
+pub async fn start_with_vars(vars: &[(&str, &str)]) -> Server {
     let (mailer, mail) = Mailer::recording();
-    let mut server = serve(mailer, &google.vars(), true).await;
+    let mut server = serve(mailer, vars, true).await;
     server.mail = mail;
     server
 }

@@ -65,8 +65,14 @@ impl Google {
         Self { url, codes }
     }
 
-    /// The settings that make a server Google's client, at this stand-in.
-    pub fn vars(&self) -> [(&str, &str); 3] {
+    /// The settings that make a server Google's client, at this stand-in, and offer its road.
+    pub fn vars(&self) -> [(&str, &str); 4] {
+        let [id, secret, url] = self.client_vars();
+        [id, secret, url, ("GOOGLE_OFFERED", "1")]
+    }
+
+    /// The settings that make a server Google's client, at this stand-in, offering nothing yet.
+    pub fn client_vars(&self) -> [(&str, &str); 3] {
         [
             ("GOOGLE_CLIENT_ID", CLIENT_ID),
             ("GOOGLE_CLIENT_SECRET", CLIENT_SECRET),
