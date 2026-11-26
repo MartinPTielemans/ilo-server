@@ -4,6 +4,7 @@
 //! A cookie names the sign-in, so its pages work only in the browser that
 //! started it.
 
+use anyhow::Context;
 use axum::Json;
 use std::net::{IpAddr, SocketAddr};
 
@@ -18,6 +19,7 @@ use webauthn_rs::prelude::{
     RegisterPublicKeyCredential, Uuid,
 };
 
+use super::google::{self, Identity, Leg, Refused};
 use super::pages;
 use crate::Shared;
 use crate::config::Config;
@@ -49,6 +51,8 @@ pub struct AuthorizeParams {
     code_challenge_method: Option<String>,
     scope: Option<String>,
     login_hint: Option<String>,
+    /// Not OIDC's: `google` goes straight on to Google, where the server has a Google client.
+    provider: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -65,6 +69,10 @@ struct SignIn {
     ceremony: Option<String>,
     codes_sent: i64,
     finished_url: Option<String>,
+    google_state: Option<String>,
+    google_nonce: Option<String>,
+    google_verifier: Option<String>,
+    google_subject: Option<String>,
 }
 
 /// Loopback addresses (RFC 8252), the server's own `/signed-in` page, which
@@ -148,7 +156,7 @@ pub async fn authorize(
     else {
         return reply_error("invalid_request", "PKCE with S256 is required");
     };
-    match start(
+    let id = match start(
         &state.db,
         &redirect_uri,
         params.state,
@@ -158,16 +166,29 @@ pub async fn authorize(
     )
     .await
     {
-        Ok(id) => (
-            [(
-                header::SET_COOKIE,
-                cookie(&state.config, &id, SIGN_IN_LIFETIME),
-            )],
-            pages::email(params.login_hint.as_deref(), None),
-        )
-            .into_response(),
-        Err(error) => internal(error),
+        Ok(id) => id,
+        Err(error) => return internal(error),
+    };
+    let set_cookie = [(
+        header::SET_COOKIE,
+        cookie(&state.config, &id, SIGN_IN_LIFETIME),
+    )];
+    // Without a Google client, the parameter is ignored and the page shows its other roads.
+    if params.provider.as_deref() == Some(google::PROVIDER) && state.config.google.is_some() {
+        return match to_google(&state, &id).await {
+            Ok(response) => (set_cookie, response).into_response(),
+            Err(error) => internal(error),
+        };
     }
+    (
+        set_cookie,
+        pages::email(params.login_hint.as_deref(), None, has_google(&state)),
+    )
+        .into_response()
+}
+
+fn has_google(state: &Shared) -> bool {
+    state.config.google.is_some()
 }
 
 async fn start(
@@ -241,7 +262,8 @@ async fn any(state: &Shared, headers: &HeaderMap) -> Result<SignIn, Response> {
     let Some(id) = id else { return Err(expired()) };
     let sign_in: Option<SignIn> = sqlx::query_as(
         "SELECT id, client_id, redirect_uri, state, nonce, code_challenge, scope, email, account_id, ceremony, \
-         codes_sent, finished_url FROM sign_ins WHERE id = $1 AND created_at > $2",
+         codes_sent, finished_url, google_state, google_nonce, google_verifier, google_subject \
+         FROM sign_ins WHERE id = $1 AND created_at > $2",
     )
     .bind(id)
     .bind(db::now() - SIGN_IN_LIFETIME)
@@ -268,7 +290,11 @@ pub async fn email(
         Err(response) => return response,
     };
     let Some(email) = super::normalize_email(&form.email) else {
-        return pages::email(Some(&form.email), Some("That isn't an email address."));
+        return pages::email(
+            Some(&form.email),
+            Some("That isn't an email address."),
+            has_google(&state),
+        );
     };
     // A code to a domain that takes no mail would bounce, which costs the server its mail
     // service's trust. The address is the one typed, so a typo is the likely cause.
@@ -277,13 +303,15 @@ pub async fn email(
         return pages::email(
             Some(&form.email),
             Some("That address can't get mail. Check it for a typo."),
+            has_google(&state),
         );
     }
     let result: anyhow::Result<Response> = async {
-        // A corrected address gets its own code and its own resend.
+        // A corrected address gets its own code and its own resend, and links no Google
+        // account waiting for the address before it.
         sqlx::query(
             "UPDATE sign_ins SET codes_sent = CASE WHEN email = $1 THEN codes_sent ELSE 0 END, \
-             email = $1, account_id = NULL, ceremony = NULL WHERE id = $2",
+             email = $1, account_id = NULL, ceremony = NULL, google_subject = NULL WHERE id = $2",
         )
         .bind(&email)
         .bind(&sign_in.id)
@@ -312,7 +340,7 @@ pub async fn send_code_again(
         }) => send_code(&state, &id, &email, &client, codes_sent > 0)
             .await
             .unwrap_or_else(internal),
-        Ok(_) => pages::email(None, None),
+        Ok(_) => pages::email(None, None, has_google(&state)),
         Err(response) => response,
     }
 }
@@ -353,7 +381,7 @@ async fn send_code(
         return code_page(state, sign_in, email, note, None).await;
     }
     if let Some(refused) = take_codes(state, email, client, now).await? {
-        return Ok(pages::email(Some(email), Some(refused)));
+        return Ok(pages::email(Some(email), Some(refused), has_google(state)));
     }
     let sent: Option<i64> = sqlx::query_scalar(
         "UPDATE sign_ins SET codes_sent = codes_sent + 1 WHERE id = $1 AND codes_sent < $2 RETURNING codes_sent",
@@ -403,6 +431,7 @@ async fn send_code(
         return Ok(pages::email(
             Some(email),
             Some("The server couldn't send mail. Try again in a moment."),
+            has_google(state),
         ));
     }
     let note = (sent > 1).then_some("We sent a new code.");
@@ -495,10 +524,11 @@ async fn code_page(
     note: Option<&str>,
     error: Option<&str>,
 ) -> anyhow::Result<Response> {
-    let codes_sent: i64 = sqlx::query_scalar("SELECT codes_sent FROM sign_ins WHERE id = $1")
-        .bind(sign_in)
-        .fetch_one(&state.db)
-        .await?;
+    let (codes_sent, google_subject): (i64, Option<String>) =
+        sqlx::query_as("SELECT codes_sent, google_subject FROM sign_ins WHERE id = $1")
+            .bind(sign_in)
+            .fetch_one(&state.db)
+            .await?;
     let expires_at: Option<i64> =
         sqlx::query_scalar("SELECT expires_at FROM sign_in_codes WHERE email = $1")
             .bind(email)
@@ -510,6 +540,7 @@ async fn code_page(
         minutes: (left + 59) / 60,
         resend: codes_sent < CODES_PER_SIGN_IN,
         note,
+        linking: google_subject.is_some(),
         error,
     });
     Ok(if error.is_some() {
@@ -534,7 +565,7 @@ pub async fn code(
         Err(response) => return response,
     };
     let Some(email) = sign_in.email.clone() else {
-        return pages::email(None, None);
+        return pages::email(None, None, has_google(&state));
     };
     let can_resend = sign_in.codes_sent < CODES_PER_SIGN_IN;
     let result: anyhow::Result<Response> = async {
@@ -581,21 +612,195 @@ pub async fn code(
             return refused("That code has already been used. Start again from ilo.").await;
         }
         let account = super::find_or_create(&state.db, &email).await?;
-        sqlx::query("UPDATE sign_ins SET account_id = $1 WHERE id = $2")
-            .bind(&account)
-            .bind(&sign_in.id)
-            .execute(&state.db)
-            .await?;
-        if super::passkeys(&state.db, &account).await?.is_empty()
-            && offer_passkey(&state.db, &account).await?
-        {
-            return Ok(pages::add_passkey());
+        // The code proves the mailbox, so the Google account that asked for it can sign in to
+        // the address's account from now on.
+        if let Some(subject) = &sign_in.google_subject {
+            link(&state.db, subject, &account).await?;
         }
-        finish(&state, &sign_in, &account).await?;
-        Ok(to_done())
+        signed_in_to(&state, &sign_in, &account).await
     }
     .await;
     result.unwrap_or_else(internal)
+}
+
+/// The end of every road but the passkey's: the passkey offer after an account's first
+/// sign-in, else the done page.
+async fn signed_in_to(state: &Shared, sign_in: &SignIn, account: &str) -> anyhow::Result<Response> {
+    // The done page names the account signed in to.
+    sqlx::query("UPDATE sign_ins SET email = $1, account_id = $2 WHERE id = $3")
+        .bind(super::email(&state.db, account).await?)
+        .bind(account)
+        .bind(&sign_in.id)
+        .execute(&state.db)
+        .await?;
+    if super::passkeys(&state.db, account).await?.is_empty()
+        && offer_passkey(&state.db, account).await?
+    {
+        return Ok(pages::add_passkey());
+    }
+    finish(state, sign_in, account).await?;
+    Ok(to_done())
+}
+
+/// Sends the sign-in's tab on to Google, with what its answer is checked against.
+async fn to_google(state: &Shared, sign_in: &str) -> anyhow::Result<Response> {
+    let google = state.config.google.as_ref().context("no Google client")?;
+    let leg = Leg::fresh();
+    sqlx::query(
+        "UPDATE sign_ins SET google_state = $1, google_nonce = $2, google_verifier = $3 WHERE id = $4",
+    )
+    .bind(&leg.state)
+    .bind(&leg.nonce)
+    .bind(&leg.verifier)
+    .bind(sign_in)
+    .execute(&state.db)
+    .await?;
+    let url = google::authorization_url(&state.config, google, &leg)?;
+    Ok(Redirect::to(&url).into_response())
+}
+
+/// The page's "Continue with Google".
+pub async fn google_start(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let sign_in = match current(&state, &headers).await {
+        Ok(sign_in) => sign_in,
+        Err(response) => return response,
+    };
+    if !has_google(&state) {
+        return pages::email(sign_in.email.as_deref(), None, false);
+    }
+    to_google(&state, &sign_in.id)
+        .await
+        .unwrap_or_else(internal)
+}
+
+#[derive(Deserialize)]
+pub struct GoogleAnswer {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Google's answer, which Google sends the tab back with.
+pub async fn google_answer(
+    State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(answer): Query<GoogleAnswer>,
+) -> Response {
+    let client = client(&state, &headers, peer);
+    let sign_in = match current(&state, &headers).await {
+        Ok(sign_in) => sign_in,
+        Err(response) => return response,
+    };
+    let Some(google) = state.config.google.as_ref() else {
+        return pages::email(None, None, false);
+    };
+    let back = |error| Ok(pages::email(None, Some(error), true));
+    let result: anyhow::Result<Response> = async {
+        let (Some(sent), Some(nonce), Some(verifier)) = (
+            sign_in.google_state.clone(),
+            sign_in.google_nonce.clone(),
+            sign_in.google_verifier.clone(),
+        ) else {
+            return back(DIDNT_FINISH);
+        };
+        // The trip's values answer one return from Google, whatever it says, and only the one
+        // whose state they sent.
+        let taken = sqlx::query(
+            "UPDATE sign_ins SET google_state = NULL, google_nonce = NULL, google_verifier = NULL \
+             WHERE id = $1 AND google_state = $2",
+        )
+        .bind(&sign_in.id)
+        .bind(&sent)
+        .execute(&state.db)
+        .await?;
+        if taken.rows_affected() == 0 || answer.state.as_deref() != Some(sent.as_str()) {
+            return back(DIDNT_FINISH);
+        }
+        let Some(code) = answer.code.filter(|_| answer.error.is_none()) else {
+            return back(if answer.error.as_deref() == Some("access_denied") {
+                "Signing in with Google was cancelled."
+            } else {
+                DIDNT_FINISH
+            });
+        };
+        let leg = Leg {
+            state: sent,
+            nonce,
+            verifier,
+        };
+        let identity = match google::exchange(&state.http, &state.config, google, &code, &leg).await {
+            Ok(identity) => identity,
+            Err(Refused::Unverified) => {
+                return back("Google hasn't verified your Google account's address. Enter it here for a code instead.");
+            }
+            Err(Refused::Failed) => return back(DIDNT_FINISH),
+        };
+        match google_account(&state, &identity).await? {
+            Some(account) => signed_in_to(&state, &sign_in, &account).await,
+            None => {
+                // The Google account is linked once the address's mailed code is in.
+                sqlx::query(
+                    "UPDATE sign_ins SET codes_sent = CASE WHEN email = $1 THEN codes_sent ELSE 0 END, \
+                     email = $1, account_id = NULL, ceremony = NULL, google_subject = $2 WHERE id = $3",
+                )
+                .bind(&identity.email)
+                .bind(&identity.subject)
+                .bind(&sign_in.id)
+                .execute(&state.db)
+                .await?;
+                send_code(&state, &sign_in.id, &identity.email, &client, false).await
+            }
+        }
+    }
+    .await;
+    result.unwrap_or_else(internal)
+}
+
+const DIDNT_FINISH: &str = "Signing in with Google didn't finish. Try again.";
+
+/// The account a Google account signs in to: the one its `sub` is linked to, else the
+/// address's, made if it has none, where Google holds the address's mailbox. None means the
+/// address's mailed code comes first. It does for every other address, with an account or
+/// without, so the pages don't say which have one.
+async fn google_account(state: &Shared, identity: &Identity) -> anyhow::Result<Option<String>> {
+    if let Some(account) = linked(&state.db, &identity.subject).await? {
+        return Ok(Some(account));
+    }
+    if !identity.owns_mailbox() {
+        return Ok(None);
+    }
+    let account = super::find_or_create(&state.db, &identity.email).await?;
+    link(&state.db, &identity.subject, &account).await?;
+    // A sign-in racing this one may have linked the Google account first.
+    linked(&state.db, &identity.subject).await
+}
+
+async fn linked(db: &Db, subject: &str) -> anyhow::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar(
+            "SELECT account_id FROM identities WHERE provider = $1 AND subject = $2",
+        )
+        .bind(google::PROVIDER)
+        .bind(subject)
+        .fetch_optional(db)
+        .await?,
+    )
+}
+
+/// Links a Google account to `account`, unless it's linked already.
+async fn link(db: &Db, subject: &str, account: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO identities (provider, subject, account_id, created_at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (provider, subject) DO NOTHING",
+    )
+    .bind(google::PROVIDER)
+    .bind(subject)
+    .bind(account)
+    .bind(db::now())
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// Whether to offer a passkey: once per account, after its first sign-in, so
@@ -618,7 +823,7 @@ pub async fn skip_passkey(State(state): State<Shared>, headers: HeaderMap) -> Re
                 .await
                 .map(|()| to_done())
                 .unwrap_or_else(internal),
-            None => pages::email(sign_in.email.as_deref(), None),
+            None => pages::email(sign_in.email.as_deref(), None, has_google(&state)),
         },
         Err(response) => response,
     }

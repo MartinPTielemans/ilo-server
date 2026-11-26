@@ -106,13 +106,15 @@ Then check that `/health` says `ok`.
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | Where it listens. |
 | `LOG` | `info` | Log filter, such as `debug` or `ilo_server=debug`. |
 | `COUNTS_PASSWORD` | | The password `GET /counts` asks for, as user `ilo`, to show the daily usage count's numbers. Unset, there's no page: `/counts` answers 404. Use a long random one: it's the page's only guard. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | A Google OAuth client of type Web application, with `$PUBLIC_URL/authorize/google` as its one redirect URI. With both, the sign-in pages offer Continue with Google; with neither, there's no Google road. One without the other stops the server at start. It asks Google for `openid email` only, and keeps the Google account's id and no Google token. |
+| `GOOGLE_TEST_URL` | | For tests only, and refused outside `DEV_MODE`: a stand-in Google, whose `/auth` and `/token` take the place of Google's and which signs the ID tokens. |
 
 ## Endpoints
 
 | | |
 |---|---|
 | `GET /.well-known/openid-configuration` | OIDC discovery. The client id is `ilo`, a public client using the code flow with PKCE (S256). |
-| `GET /authorize` | The sign-in pages: email or a passkey, the mailed code, a passkey offered once after an account's first sign-in, and a done page that sends the tab back to the client with `code`, `state` and `iss`. |
+| `GET /authorize` | The sign-in pages: email, a passkey or Google (`provider=google` goes straight to Google, which comes back to `/authorize/google`), the mailed code, a passkey offered once after an account's first sign-in, and a done page that sends the tab back to the client with `code`, `state` and `iss`. |
 | `POST /token` | `authorization_code` (takes an optional `device_name`) and `refresh_token`. Each code exchange makes a device, and mails the account when it already had one. Refresh tokens rotate. |
 | `GET /userinfo`, `GET /jwks`, `POST /revoke` | Revoking a refresh token signs its device out. |
 | `POST /command/` | Chromium sync: GetUpdates, Commit, ClearServerData. Bearer access token. |

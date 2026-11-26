@@ -13,6 +13,9 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; st
 /// the page's ink. The code mail shows it as PNGs drawn from this (src/mail).
 const MARK: &str = r##"<svg class="mark" viewBox="4 16 217 154" role="img" aria-label="ilo"><circle cx="19" cy="31" r="15" fill="#0E9F55"/><rect x="7" y="70" width="24" height="100" rx="12" fill="currentColor"/><rect x="67" y="20" width="24" height="150" rx="12" fill="currentColor"/><circle cx="171" cy="120" r="38" fill="none" stroke="currentColor" stroke-width="24"/></svg>"##;
 
+/// Google's "G", in Google's colours, as Google's sign-in branding asks the button to carry it.
+const GOOGLE_G: &str = r##"<svg viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>"##;
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -62,7 +65,17 @@ fn alert(error: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-pub fn email(hint: Option<&str>, error: Option<&str>) -> Response {
+/// The first page. `google` draws Google's button, for a server with a Google client.
+pub fn email(hint: Option<&str>, error: Option<&str>, google: bool) -> Response {
+    // A link, not a form: `form-action 'self'` would stop a form's redirect on to Google.
+    let google = if google {
+        format!(
+            r#"<div class="actions"><a class="button quiet google" href="/authorize/google/start">{GOOGLE_G}Continue with Google</a></div>
+"#
+        )
+    } else {
+        String::new()
+    };
     page(
         "Sign in to ilo",
         "",
@@ -74,7 +87,7 @@ pub fn email(hint: Option<&str>, error: Option<&str>) -> Response {
 <button>Continue</button>
 </form>
 <p class="error" id="passkey-error" role="alert" hidden></p>
-<form><button type="button" class="quiet" data-passkey="login">Use a passkey</button></form>"#,
+{google}<form><button type="button" class="quiet" data-passkey="login">Use a passkey</button></form>"#,
             alert(error),
             escape(hint.unwrap_or_default())
         ),
@@ -89,6 +102,8 @@ pub struct Code<'a> {
     pub resend: bool,
     /// Said once a new code is sent.
     pub note: Option<&'a str>,
+    /// Whether the code links a Google account to the address.
+    pub linking: bool,
     pub error: Option<&'a str>,
 }
 
@@ -111,13 +126,18 @@ pub fn code(sent: Code) -> Response {
         "Check your email",
         "",
         &format!(
-            r#"<p>We sent a 6-digit code to <strong>{}</strong>. {expires}</p>
+            r#"<p>{} <strong>{}</strong>. {expires}</p>
 {note}{}
 <form method="post" action="/authorize/code">
 <input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="12" required autofocus placeholder="000000" aria-label="Code">
 <button>Sign in</button>
 </form>
 {resend}"#,
+            if sent.linking {
+                "To sign in with Google from now on, enter the 6-digit code we sent to"
+            } else {
+                "We sent a 6-digit code to"
+            },
             escape(sent.email),
             alert(sent.error)
         ),

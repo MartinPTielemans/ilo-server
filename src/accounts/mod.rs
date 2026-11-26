@@ -1,7 +1,8 @@
-//! Accounts: sign-in by mailed code or passkey, and the OpenID Connect
+//! Accounts: sign-in by mailed code, passkey or Google, and the OpenID Connect
 //! provider through which ilo gets its tokens.
 
 pub mod devices;
+pub mod google;
 pub mod oidc;
 mod pages;
 pub use pages::{script as pages_script, style as pages_style};

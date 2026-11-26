@@ -16,7 +16,7 @@ use crate::tokens::{self, Authenticated, Device, Tokens};
 
 pub async fn discovery(State(state): State<Shared>) -> Json<Value> {
     let config = &state.config;
-    Json(json!({
+    let mut discovery = json!({
         "issuer": config.issuer(),
         "authorization_endpoint": config.url("/authorize"),
         "token_endpoint": config.url("/token"),
@@ -32,7 +32,12 @@ pub async fn discovery(State(state): State<Shared>) -> Json<Value> {
         "scopes_supported": ["openid", "email", "offline_access"],
         "claims_supported": ["iss", "sub", "aud", "exp", "iat", "nonce", "email", "email_verified", "sid"],
         "authorization_response_iss_parameter_supported": true,
-    }))
+    });
+    // Not OIDC's: `/authorize` takes `provider=google`, and its page offers Google.
+    if config.google.is_some() {
+        discovery["ilo_google"] = json!(true);
+    }
+    Json(discovery)
 }
 
 pub async fn jwks(State(state): State<Shared>) -> Response {

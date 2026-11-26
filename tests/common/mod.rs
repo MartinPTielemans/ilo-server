@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod google;
 pub mod passkey;
 
 use std::sync::{Arc, Mutex};
@@ -53,6 +54,14 @@ pub async fn start() -> Server {
 /// A server that sends its mail with `mailer`, which `Server::mail` doesn't see.
 pub async fn start_with(mailer: Mailer) -> Server {
     serve(mailer, &[], true).await
+}
+
+/// A server that is `google`'s client, as one with `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+pub async fn start_with_google(google: &google::Google) -> Server {
+    let (mailer, mail) = Mailer::recording();
+    let mut server = serve(mailer, &google.vars(), true).await;
+    server.mail = mail;
+    server
 }
 
 /// A server on a fresh SQLite file, even when the tests share a Postgres, with
