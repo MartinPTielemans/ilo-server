@@ -179,3 +179,47 @@ async fn token(State(codes): State<Codes>, Form(form): Form<HashMap<String, Stri
     }))
     .into_response()
 }
+
+/// Opens a sign-in in `browser` that goes straight on to Google: the URL of Google's page.
+pub async fn to_google(
+    server: &super::Server,
+    browser: &reqwest::Client,
+    pkce: &super::Pkce,
+) -> url::Url {
+    let start = browser
+        .get(server.authorize_url(pkce, "state-1") + "&provider=google")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 303);
+    url::Url::parse(start.headers()["location"].to_str().unwrap()).unwrap()
+}
+
+/// Google sends the tab back to the server: the server's answer.
+pub async fn from_google(browser: &reqwest::Client, back: url::Url) -> reqwest::Response {
+    browser.get(back).send().await.unwrap()
+}
+
+/// `person` signs in with Google, from a new sign-in to its redirect, saying "Not now" to a
+/// passkey: the account's tokens.
+pub async fn google_tokens(server: &super::Server, google: &Google, person: &Person) -> Value {
+    let browser = super::browser();
+    let pkce = super::pkce();
+    let at_google = to_google(server, &browser, &pkce).await;
+    let mut answer = from_google(&browser, google.sign_in(&at_google, person)).await;
+    if answer.status() == 200 {
+        assert!(answer.text().await.unwrap().contains("Add a passkey"));
+        answer = browser
+            .post(format!("{}/authorize/continue", server.url))
+            .send()
+            .await
+            .unwrap();
+    }
+    let code = server.done(&browser, answer).await;
+    server
+        .exchange(&code, &pkce.verifier, "Mac")
+        .await
+        .json()
+        .await
+        .unwrap()
+}

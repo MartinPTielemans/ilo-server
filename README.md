@@ -120,6 +120,7 @@ Then check that `/health` says `ok`.
 | `POST /command/` | Chromium sync: GetUpdates, Commit, ClearServerData. Bearer access token. |
 | `GET /relay` | The device's WebSocket, which also carries pairing. Bearer access token. |
 | `GET /api/devices`, `DELETE /api/devices/{id}`, `DELETE /api/account` | The account's devices, removing one, and deleting the account with all its data. |
+| `GET /api/identities`, `DELETE /api/identities/google` | The account's linked Google sign-in, and removing it. The mailed code still signs in, and Google links again only with it. |
 | `POST /v1/daily` | ilo's daily usage count, a JSON body of version, channel, OS, OS major, chip and flags, answered 204. It adds one to that day's row for those fields and keeps nothing else. `ilo-server counts` prints daily, weekly and monthly users and new installs. |
 | `GET /counts` | Those numbers as a page, with a chart of the last 14 days' users, behind HTTP Basic auth as user `ilo` with `COUNTS_PASSWORD`, so no secret goes in a URL a proxy's log records. Without the variable it answers 404. Never cached or indexed. |
 | `GET /health` | `ok` while the database answers. |

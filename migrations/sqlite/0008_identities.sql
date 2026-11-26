@@ -14,3 +14,6 @@ ALTER TABLE sign_ins ADD COLUMN google_nonce TEXT;
 ALTER TABLE sign_ins ADD COLUMN google_verifier TEXT;
 -- A Google account waiting to be linked to the address's account once its mailed code is in.
 ALTER TABLE sign_ins ADD COLUMN google_subject TEXT;
+-- Set once the account removes its Google sign-in: Google then links to it again only with the
+-- address's mailed code, even where Google holds the mailbox.
+ALTER TABLE accounts ADD COLUMN google_removed INTEGER NOT NULL DEFAULT 0;

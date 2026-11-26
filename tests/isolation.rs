@@ -229,3 +229,52 @@ async fn no_step_of_another_accounts_pairing_answers_or_ends_it() {
     assert_eq!(accepted["type"], "pair_accept", "{accepted}");
     assert_eq!(accepted["from"], mac.device);
 }
+
+#[tokio::test]
+async fn another_account_can_neither_list_nor_remove_an_accounts_google_sign_in() {
+    let google = common::google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let person =
+        common::google::Person::new(&unique_email("linked").replace("@example.org", "@gmail.com"));
+    let owner = common::google::google_tokens(&server, &google, &person).await;
+    let owner = owner["access_token"].as_str().unwrap();
+    let other = server.device(&unique_email("other"), "Mac").await;
+
+    let listed: Value = api(
+        &server,
+        reqwest::Method::GET,
+        "/api/identities",
+        &other.access_token,
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(listed["identities"], json!([]));
+    let removed = api(
+        &server,
+        reqwest::Method::DELETE,
+        "/api/identities/google",
+        &other.access_token,
+    )
+    .await;
+    assert_eq!(removed.status(), 404);
+
+    let listed: Value = api(&server, reqwest::Method::GET, "/api/identities", owner)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["identities"][0]["email"], person.email.as_str());
+    for path in ["/api/identities", "/api/identities/google"] {
+        let method = if path.ends_with("google") {
+            reqwest::Method::DELETE
+        } else {
+            reqwest::Method::GET
+        };
+        assert_eq!(
+            api(&server, method, path, "no-such-token").await.status(),
+            401
+        );
+    }
+}

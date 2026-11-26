@@ -2,6 +2,7 @@ mod common;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::google::{from_google, google_tokens, to_google};
 use common::*;
 use serde_json::Value;
 
@@ -941,46 +942,6 @@ async fn a_restarted_server_keeps_its_signing_key() {
     assert_eq!(keys[0], keys[1]);
 }
 
-/// Opens a sign-in in `browser` that goes straight on to Google: the URL of Google's page.
-async fn to_google(server: &Server, browser: &reqwest::Client, pkce: &Pkce) -> url::Url {
-    let start = browser
-        .get(server.authorize_url(pkce, "state-1") + "&provider=google")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(start.status(), 303);
-    url::Url::parse(start.headers()["location"].to_str().unwrap()).unwrap()
-}
-
-/// Google sends the tab back to the server: the server's answer.
-async fn from_google(browser: &reqwest::Client, back: url::Url) -> reqwest::Response {
-    browser.get(back).send().await.unwrap()
-}
-
-/// `person` signs in with Google, from a new sign-in to its redirect, saying "Not now" to a
-/// passkey: the account's tokens.
-async fn google_tokens(server: &Server, google: &google::Google, person: &google::Person) -> Value {
-    let browser = browser();
-    let pkce = pkce();
-    let at_google = to_google(server, &browser, &pkce).await;
-    let mut answer = from_google(&browser, google.sign_in(&at_google, person)).await;
-    if answer.status() == 200 {
-        assert!(answer.text().await.unwrap().contains("Add a passkey"));
-        answer = browser
-            .post(format!("{}/authorize/continue", server.url))
-            .send()
-            .await
-            .unwrap();
-    }
-    let code = server.done(&browser, answer).await;
-    server
-        .exchange(&code, &pkce.verifier, "Mac")
-        .await
-        .json()
-        .await
-        .unwrap()
-}
-
 async fn linked_account(server: &Server, person: &google::Person) -> Option<String> {
     sqlx::query_scalar(
         "SELECT account_id FROM identities WHERE provider = 'google' AND subject = $1",
@@ -1342,4 +1303,106 @@ async fn a_server_says_whether_it_has_a_google_road() {
     let person = google::Person::new(&gmail("button"));
     let answer = from_google(&browser, google.sign_in(&at_google, &person)).await;
     assert!(answer.text().await.unwrap().contains("Add a passkey"));
+}
+
+async fn listed_identities(server: &Server, token: &str) -> Value {
+    let listed = reqwest::Client::new()
+        .get(format!("{}/api/identities", server.url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    listed.json().await.unwrap()
+}
+
+async fn remove_google(server: &Server, token: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .delete(format!("{}/api/identities/google", server.url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn a_linked_google_sign_in_is_listed_and_removed_and_then_needs_the_mailed_code() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let person = google::Person::new(&gmail("removed"));
+    let tokens = google_tokens(&server, &google, &person).await;
+    let token = tokens["access_token"].as_str().unwrap();
+    let account = subject(&server, &tokens).await;
+
+    let listed = listed_identities(&server, token).await;
+    let identities = listed["identities"].as_array().unwrap();
+    assert_eq!(identities.len(), 1, "{listed}");
+    assert_eq!(identities[0]["provider"], "google");
+    assert_eq!(identities[0]["email"], person.email);
+    assert!(identities[0]["linked_at"].as_i64().unwrap() > 0);
+    assert!(
+        !listed.to_string().contains(&person.sub),
+        "Google's id isn't shown"
+    );
+
+    assert_eq!(remove_google(&server, token).await, 204);
+    assert_eq!(
+        listed_identities(&server, token).await["identities"],
+        serde_json::json!([])
+    );
+    assert_eq!(linked_account(&server, &person).await, None);
+    assert_eq!(
+        remove_google(&server, token).await,
+        404,
+        "nothing left to remove"
+    );
+
+    // Google alone no longer signs in, even with the Gmail address Google holds.
+    let browser = browser();
+    let pkce = pkce();
+    let at_google = to_google(&server, &browser, &pkce).await;
+    let page = from_google(&browser, google.sign_in(&at_google, &person)).await;
+    assert_eq!(page.status(), 200);
+    assert!(
+        page.text()
+            .await
+            .unwrap()
+            .contains("To sign in with Google")
+    );
+    assert_eq!(linked_account(&server, &person).await, None);
+
+    // The mailed code still signs in, from another tab.
+    let device = server.device(&person.email, "Phone").await;
+    let userinfo: Value = reqwest::Client::new()
+        .get(format!("{}/userinfo", server.url))
+        .bearer_auth(&device.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(userinfo["sub"], account.as_str());
+
+    // And in the Google tab, entering the code links Google again: the user's own choice.
+    sqlx::query("UPDATE sign_in_codes SET sent_at = sent_at - 60 WHERE email = $1")
+        .bind(&person.email)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let page = browser
+        .post(format!("{}/authorize/send-code", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert!(page.text().await.unwrap().contains("We sent a new code."));
+    let finished = browser
+        .post(format!("{}/authorize/code", server.url))
+        .form(&[("code", server.last_code(&person.email))])
+        .send()
+        .await
+        .unwrap();
+    server.done(&browser, finished).await;
+    assert_eq!(linked_account(&server, &person).await, Some(account));
 }

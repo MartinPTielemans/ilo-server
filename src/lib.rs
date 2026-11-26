@@ -111,6 +111,11 @@ pub fn router(state: Shared) -> Router {
         .route("/revoke", post(oidc::revoke))
         .route("/api/devices", get(devices::list))
         .route("/api/devices/{id}", delete(devices::remove))
+        .route("/api/identities", get(devices::identities))
+        .route(
+            "/api/identities/{provider}",
+            delete(devices::remove_identity),
+        )
         .route("/api/account", delete(devices::delete_account))
         .route(
             "/command/",

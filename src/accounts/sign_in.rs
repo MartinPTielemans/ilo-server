@@ -760,14 +760,19 @@ pub async fn google_answer(
 const DIDNT_FINISH: &str = "Signing in with Google didn't finish. Try again.";
 
 /// The account a Google account signs in to: the one its `sub` is linked to, else the
-/// address's, made if it has none, where Google holds the address's mailbox. None means the
-/// address's mailed code comes first. It does for every other address, with an account or
-/// without, so the pages don't say which have one.
+/// address's, made if it has none, where Google holds the address's mailbox and the account
+/// hasn't removed Google. None means the address's mailed code comes first. It does for every
+/// other address, with an account or without, so the pages don't say which have one.
 async fn google_account(state: &Shared, identity: &Identity) -> anyhow::Result<Option<String>> {
     if let Some(account) = linked(&state.db, &identity.subject).await? {
         return Ok(Some(account));
     }
-    if !identity.owns_mailbox() {
+    let removed: Option<i64> =
+        sqlx::query_scalar("SELECT google_removed FROM accounts WHERE email = $1")
+            .bind(&identity.email)
+            .fetch_optional(&state.db)
+            .await?;
+    if !identity.owns_mailbox() || removed == Some(1) {
         return Ok(None);
     }
     let account = super::find_or_create(&state.db, &identity.email).await?;
