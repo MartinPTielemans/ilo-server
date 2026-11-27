@@ -179,7 +179,7 @@ details tr:last-child > * {{ border-bottom: 0; }}
 }
 
 /// Each of the 14 days that had counts, newest first and open, as the kinds of copy that counted
-/// on it, so a day's users can be told apart: a release's, a nightly's, one system's.
+/// on it, so a day's users can be told apart: a release's, a nightly's, the rework's, one system's.
 fn kinds(numbers: &Numbers) -> String {
     let mut out = String::new();
     let days = numbers.days.iter().zip(&numbers.kinds);

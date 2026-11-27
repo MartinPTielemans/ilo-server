@@ -46,7 +46,7 @@ impl Count {
                 !part.is_empty() && part.len() <= 5 && part.bytes().all(|b| b.is_ascii_digit())
             });
         version_ok
-            && matches!(self.channel.as_str(), "release" | "nightly")
+            && matches!(self.channel.as_str(), "release" | "nightly" | "rework")
             && matches!(self.os.as_str(), "macos" | "windows" | "linux")
             && (0..1000).contains(&self.os_major)
             && matches!(self.chip.as_str(), "arm64" | "x64")
@@ -422,6 +422,16 @@ mod tests {
         assert!(!count("0.1.9", "plan9", true).valid());
         for version in ["", "1..2", "0.1.9-dev", "1.2.3.4.5.6.7.8.9", "v1"] {
             assert!(!count(version, "linux", true).valid(), "{version}");
+        }
+        let on = |channel: &str| Count {
+            channel: channel.into(),
+            ..count("0.1.9", "macos", true)
+        };
+        for channel in ["release", "nightly", "rework"] {
+            assert!(on(channel).valid(), "{channel}");
+        }
+        for channel in ["", "beta", "Rework"] {
+            assert!(!on(channel).valid(), "{channel}");
         }
     }
 }

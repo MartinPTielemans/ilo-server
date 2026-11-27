@@ -120,7 +120,7 @@ Each copy of ilo with Settings › Privacy › Send a Daily Usage Count on, whic
  "first":false,"daily":true,"weekly":true,"monthly":false}
 ```
 
-- `channel` is `release` or `nightly`, `os` is `macos`, `windows` or `linux`, and `chip` is `arm64` or `x64`. `os_major` is macOS's major version, Windows' 10 or 11, or Linux's kernel's.
+- `channel` is `release`, `nightly` or `rework`, the owner's daily copy of the browser's rework, which counts apart from the releases. `os` is `macos`, `windows` or `linux`, and `chip` is `arm64` or `x64`. `os_major` is macOS's major version, Windows' 10 or 11, or Linux's kernel's.
 - `first` is the copy's first run, `daily` is always true, and `weekly` and `monthly` say it's the copy's first count this ISO week and this calendar month. The copy works them out from the date of its last count, the only thing it keeps.
 - The server answers 204, and 400 or 422 to anything else, which it doesn't store. It adds one to the row for that UTC day and those fields. It keeps no ID, address, user agent or time of day, and logs nothing about the request.
 
