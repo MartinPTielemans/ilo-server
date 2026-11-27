@@ -30,7 +30,7 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use webauthn_rs::{Webauthn, WebauthnBuilder};
 
-use accounts::{devices, oidc, sign_in};
+use accounts::{devices, native, oidc, sign_in};
 use config::Config;
 use mail::{Domains, Mailer};
 
@@ -103,6 +103,9 @@ pub fn router(state: Shared) -> Router {
             "/authorize/passkey/login/finish",
             post(sign_in::login_finish),
         )
+        .route("/native/sign-in", post(native::start))
+        .route("/native/sign-in/code", post(native::code))
+        .route("/native/sign-in/resend", post(native::resend))
         .route("/sign-in.js", get(accounts::pages_script))
         .route("/sign-in.css", get(accounts::pages_style))
         .route("/signed-in", get(sign_in::signed_in))

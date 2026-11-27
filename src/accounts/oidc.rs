@@ -33,6 +33,9 @@ pub async fn discovery(State(state): State<Shared>) -> Json<Value> {
         "claims_supported": ["iss", "sub", "aud", "exp", "iat", "nonce", "email", "email_verified", "sid"],
         "authorization_response_iss_parameter_supported": true,
     });
+    // Not OIDC's: the app can take the address and the code itself (`super::native`), and the
+    // page draws only its passkey step at `ilo_road=passkey`.
+    discovery["ilo_native_sign_in"] = json!(true);
     // Not OIDC's: `/authorize` takes `provider=google`, and its page offers Google.
     if config.offered_google().is_some() {
         discovery["ilo_google"] = json!(true);
@@ -99,6 +102,30 @@ struct AuthorizationCode {
     code_challenge: String,
     scope: String,
     account_id: String,
+}
+
+/// `/token`'s answer to an authorization code the server has just made itself, for the app's
+/// own sign-in road (`super::native`), which checks the code's verifier as `/token` does.
+pub(super) async fn exchange(
+    state: &Shared,
+    code: String,
+    verifier: String,
+    redirect_uri: String,
+    device_name: Option<String>,
+) -> anyhow::Result<Response> {
+    exchange_code(
+        state,
+        TokenRequest {
+            grant_type: "authorization_code".to_owned(),
+            code: Some(code),
+            redirect_uri: Some(redirect_uri),
+            client_id: Some(CLIENT_ID.to_owned()),
+            code_verifier: Some(verifier),
+            refresh_token: None,
+            device_name,
+        },
+    )
+    .await
 }
 
 async fn exchange_code(state: &Shared, request: TokenRequest) -> anyhow::Result<Response> {

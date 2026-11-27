@@ -27,12 +27,12 @@ use crate::db::{self, Db};
 
 pub const CLIENT_ID: &str = "ilo";
 const COOKIE: &str = "ilo_sign_in";
-const SIGN_IN_LIFETIME: i64 = 15 * 60;
-const CODE_LIFETIME: i64 = 10 * 60;
-const CODE_RESEND_AFTER: i64 = 30;
+pub(super) const SIGN_IN_LIFETIME: i64 = 15 * 60;
+pub(super) const CODE_LIFETIME: i64 = 10 * 60;
+pub(super) const CODE_RESEND_AFTER: i64 = 30;
 const CODE_ATTEMPTS: i64 = 5;
 /// The first code and one new one.
-const CODES_PER_SIGN_IN: i64 = 2;
+pub(super) const CODES_PER_SIGN_IN: i64 = 2;
 /// Codes an address gets in an hour, across every sign-in that asks: five tries
 /// each, so guessing one of a million codes takes years, not hours.
 const CODES_PER_ADDRESS_PER_HOUR: i64 = 5;
@@ -53,26 +53,29 @@ pub struct AuthorizeParams {
     login_hint: Option<String>,
     /// Not OIDC's: `google` goes straight on to Google, where the server has a Google client.
     provider: Option<String>,
+    /// Not OIDC's: `passkey` draws the passkey step alone, for an app that takes the address and
+    /// the code itself (`super::native`).
+    ilo_road: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
-struct SignIn {
-    id: String,
-    client_id: String,
-    redirect_uri: String,
-    state: Option<String>,
-    nonce: Option<String>,
-    code_challenge: String,
-    scope: String,
-    email: Option<String>,
-    account_id: Option<String>,
-    ceremony: Option<String>,
-    codes_sent: i64,
-    finished_url: Option<String>,
-    google_state: Option<String>,
-    google_nonce: Option<String>,
-    google_verifier: Option<String>,
-    google_subject: Option<String>,
+pub(super) struct SignIn {
+    pub(super) id: String,
+    pub(super) client_id: String,
+    pub(super) redirect_uri: String,
+    pub(super) state: Option<String>,
+    pub(super) nonce: Option<String>,
+    pub(super) code_challenge: String,
+    pub(super) scope: String,
+    pub(super) email: Option<String>,
+    pub(super) account_id: Option<String>,
+    pub(super) ceremony: Option<String>,
+    pub(super) codes_sent: i64,
+    pub(super) finished_url: Option<String>,
+    pub(super) google_state: Option<String>,
+    pub(super) google_nonce: Option<String>,
+    pub(super) google_verifier: Option<String>,
+    pub(super) google_subject: Option<String>,
 }
 
 /// Loopback addresses (RFC 8252), the server's own `/signed-in` page, which
@@ -181,6 +184,9 @@ pub async fn authorize(
             Err(error) => internal(error),
         };
     }
+    if params.ilo_road.as_deref() == Some("passkey") {
+        return (set_cookie, pages::passkey()).into_response();
+    }
     (
         set_cookie,
         pages::email(params.login_hint.as_deref(), None, has_google(&state)),
@@ -193,7 +199,7 @@ fn has_google(state: &Shared) -> bool {
     state.config.offered_google().is_some()
 }
 
-async fn start(
+pub(super) async fn start(
     db: &Db,
     redirect_uri: &str,
     state: Option<String>,
@@ -262,7 +268,15 @@ async fn any(state: &Shared, headers: &HeaderMap) -> Result<SignIn, Response> {
             .into_response()
     };
     let Some(id) = id else { return Err(expired()) };
-    let sign_in: Option<SignIn> = sqlx::query_as(
+    by_id(state, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(expired)
+}
+
+/// The sign-in named `id`, while it lasts.
+pub(super) async fn by_id(state: &Shared, id: &str) -> anyhow::Result<Option<SignIn>> {
+    Ok(sqlx::query_as(
         "SELECT id, client_id, redirect_uri, state, nonce, code_challenge, scope, email, account_id, ceremony, \
          codes_sent, finished_url, google_state, google_nonce, google_verifier, google_subject \
          FROM sign_ins WHERE id = $1 AND created_at > $2",
@@ -270,9 +284,7 @@ async fn any(state: &Shared, headers: &HeaderMap) -> Result<SignIn, Response> {
     .bind(id)
     .bind(db::now() - SIGN_IN_LIFETIME)
     .fetch_optional(&state.db)
-    .await
-    .map_err(|error| internal(error.into()))?;
-    sign_in.ok_or_else(expired)
+    .await?)
 }
 
 #[derive(Deserialize)]
@@ -349,7 +361,7 @@ pub async fn send_code_again(
 
 /// Who asks for codes, as the limits count it: the address the proxy in front names, else the
 /// connection's. An IPv6 client counts by its /64, which one network can hand out at will.
-fn client(state: &Shared, headers: &HeaderMap, peer: SocketAddr) -> String {
+pub(super) fn client(state: &Shared, headers: &HeaderMap, peer: SocketAddr) -> String {
     let named = (state.config.client_ip_header.as_deref())
         .and_then(|header| headers.get(header)?.to_str().ok())
         // The last address in a list is the one the proxy itself saw.
@@ -363,6 +375,20 @@ fn client(state: &Shared, headers: &HeaderMap, peer: SocketAddr) -> String {
     }
 }
 
+/// What asking for a code did.
+pub(super) enum Sent {
+    /// A code was mailed: the sign-in's first, or its one new one.
+    Mailed { first: bool },
+    /// The address was mailed a code moments ago, which still stands, so none was sent.
+    Recent,
+    /// A limit refused it.
+    Refused(Limit),
+    /// The sign-in has had all its codes.
+    NoMore,
+    /// The mail didn't go, and nothing was counted.
+    MailFailed,
+}
+
 async fn send_code(
     state: &Shared,
     sign_in: &str,
@@ -370,6 +396,44 @@ async fn send_code(
     client: &str,
     again: bool,
 ) -> anyhow::Result<Response> {
+    Ok(match mail_code(state, sign_in, email, client).await? {
+        Sent::Mailed { first } => {
+            let note = (!first).then_some("We sent a new code.");
+            code_page(state, sign_in, email, note, None).await?
+        }
+        Sent::Recent => {
+            let note =
+                again.then_some("We sent a code a moment ago. It can take a minute to arrive.");
+            code_page(state, sign_in, email, note, None).await?
+        }
+        Sent::Refused(limit) => {
+            pages::email(Some(email), Some(limit.page_text()), has_google(state))
+        }
+        Sent::NoMore => {
+            code_page(
+                state,
+                sign_in,
+                email,
+                None,
+                Some("We can't send another code. If it hasn't arrived, start again from ilo."),
+            )
+            .await?
+        }
+        Sent::MailFailed => pages::email(
+            Some(email),
+            Some("The server couldn't send mail. Try again in a moment."),
+            has_google(state),
+        ),
+    })
+}
+
+/// Mails `email` a code for the sign-in, within the limits, which every road shares.
+pub(super) async fn mail_code(
+    state: &Shared,
+    sign_in: &str,
+    email: &str,
+    client: &str,
+) -> anyhow::Result<Sent> {
     let now = db::now();
     // Reloading the page or pressing twice doesn't mail again.
     let recent: Option<i64> =
@@ -379,11 +443,10 @@ async fn send_code(
             .fetch_optional(&state.db)
             .await?;
     if recent.is_some() {
-        let note = again.then_some("We sent a code a moment ago. It can take a minute to arrive.");
-        return code_page(state, sign_in, email, note, None).await;
+        return Ok(Sent::Recent);
     }
     if let Some(refused) = take_codes(state, email, client, now).await? {
-        return Ok(pages::email(Some(email), Some(refused), has_google(state)));
+        return Ok(Sent::Refused(refused));
     }
     let sent: Option<i64> = sqlx::query_scalar(
         "UPDATE sign_ins SET codes_sent = codes_sent + 1 WHERE id = $1 AND codes_sent < $2 RETURNING codes_sent",
@@ -394,14 +457,7 @@ async fn send_code(
     .await?;
     let Some(sent) = sent else {
         give_back_codes(state, email, client).await?;
-        return code_page(
-            state,
-            sign_in,
-            email,
-            None,
-            Some("We can't send another code. If it hasn't arrived, start again from ilo."),
-        )
-        .await;
+        return Ok(Sent::NoMore);
     };
     let code = format!(
         "{:06}",
@@ -430,14 +486,29 @@ async fn send_code(
             .execute(&state.db)
             .await?;
         give_back_codes(state, email, client).await?;
-        return Ok(pages::email(
-            Some(email),
-            Some("The server couldn't send mail. Try again in a moment."),
-            has_google(state),
-        ));
+        return Ok(Sent::MailFailed);
     }
-    let note = (sent > 1).then_some("We sent a new code.");
-    code_page(state, sign_in, email, note, None).await
+    Ok(Sent::Mailed { first: sent == 1 })
+}
+
+/// A limit on mailed codes that refused one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Limit {
+    Address,
+    Client,
+    Server,
+}
+
+impl Limit {
+    fn page_text(self) -> &'static str {
+        match self {
+            Limit::Address => "We've sent this address too many codes. Try again in an hour.",
+            Limit::Client => {
+                "We've sent too many codes to sign-ins from your network. Try again in an hour."
+            }
+            Limit::Server => "The server has sent all the codes it can for today. Try again later.",
+        }
+    }
 }
 
 /// Takes a code from each limit, the address's, the client's and the server's, or none and says
@@ -447,34 +518,29 @@ async fn take_codes(
     email: &str,
     client: &str,
     now: i64,
-) -> anyhow::Result<Option<&'static str>> {
+) -> anyhow::Result<Option<Limit>> {
     let config = &state.config;
     let limits = [
         (
             format!("address {email}"),
             HOUR,
             CODES_PER_ADDRESS_PER_HOUR,
-            "We've sent this address too many codes. Try again in an hour.",
+            Limit::Address,
         ),
         (
             client.to_owned(),
             HOUR,
             config.codes_per_client_per_hour,
-            "We've sent too many codes to sign-ins from your network. Try again in an hour.",
+            Limit::Client,
         ),
-        (
-            "all".to_owned(),
-            DAY,
-            config.codes_per_day,
-            "The server has sent all the codes it can for today. Try again later.",
-        ),
+        ("all".to_owned(), DAY, config.codes_per_day, Limit::Server),
     ];
     for (index, (name, window, limit, refused)) in limits.iter().enumerate() {
         if !take(&state.db, name, now, *window, *limit).await? {
             for (name, ..) in &limits[..index] {
                 give_back(&state.db, name).await?;
             }
-            return Ok(Some(refused));
+            return Ok(Some(*refused));
         }
     }
     Ok(None)
@@ -571,47 +637,23 @@ pub async fn code(
     };
     let can_resend = sign_in.codes_sent < CODES_PER_SIGN_IN;
     let result: anyhow::Result<Response> = async {
-        let now = db::now();
-        // Counting the try in the same statement that reads the code, so tries
-        // sent at once can't all be checked before any is counted.
-        let code_hash: Option<String> = sqlx::query_scalar(
-            "UPDATE sign_in_codes SET attempts = attempts + 1 \
-             WHERE email = $1 AND expires_at > $2 AND attempts < $3 RETURNING code_hash",
-        )
-        .bind(&email)
-        .bind(now)
-        .bind(CODE_ATTEMPTS)
-        .fetch_optional(&state.db)
-        .await?;
         let refused = |error| code_page(&state, &sign_in.id, &email, None, Some(error));
-        let Some(code_hash) = code_hash else {
-            let live: Option<i64> = sqlx::query_scalar(
-                "SELECT attempts FROM sign_in_codes WHERE email = $1 AND expires_at > $2",
-            )
-            .bind(&email)
-            .bind(now)
-            .fetch_optional(&state.db)
-            .await?;
-            return refused(match (live.is_some(), can_resend) {
-                (true, true) => "Too many tries. Send a new code.",
-                (true, false) => "Too many tries. Start again from ilo.",
-                (false, true) => "That code has expired. Send a new one.",
-                (false, false) => "That code has expired. Start again from ilo.",
-            })
-            .await;
-        };
-        let typed: String = form.code.chars().filter(|c| !c.is_whitespace()).collect();
-        if db::hash(&typed) != code_hash {
-            return refused("That code isn't right.").await;
-        }
-        // Only one of two tries with the right code signs in.
-        let used = sqlx::query("DELETE FROM sign_in_codes WHERE email = $1 AND code_hash = $2")
-            .bind(&email)
-            .bind(&code_hash)
-            .execute(&state.db)
-            .await?;
-        if used.rows_affected() == 0 {
-            return refused("That code has already been used. Start again from ilo.").await;
+        match check_code(&state, &email, &form.code).await? {
+            Checked::Right => {}
+            Checked::Wrong => return refused("That code isn't right.").await,
+            Checked::TooMany if can_resend => {
+                return refused("Too many tries. Send a new code.").await;
+            }
+            Checked::TooMany => return refused("Too many tries. Start again from ilo.").await,
+            Checked::Expired if can_resend => {
+                return refused("That code has expired. Send a new one.").await;
+            }
+            Checked::Expired => {
+                return refused("That code has expired. Start again from ilo.").await;
+            }
+            Checked::Used => {
+                return refused("That code has already been used. Start again from ilo.").await;
+            }
         }
         let account = super::find_or_create(&state.db, &email).await?;
         // The code proves the mailbox, so the Google account that asked for it can sign in to
@@ -623,6 +665,65 @@ pub async fn code(
     }
     .await;
     result.unwrap_or_else(internal)
+}
+
+/// What a typed code was, as every road reads it.
+pub(super) enum Checked {
+    Right,
+    Wrong,
+    TooMany,
+    Expired,
+    Used,
+}
+
+/// Checks `typed` against the code mailed to `email`, counting the try, and uses it up when it's
+/// right.
+pub(super) async fn check_code(
+    state: &Shared,
+    email: &str,
+    typed: &str,
+) -> anyhow::Result<Checked> {
+    let now = db::now();
+    // Counting the try in the same statement that reads the code, so tries
+    // sent at once can't all be checked before any is counted.
+    let code_hash: Option<String> = sqlx::query_scalar(
+        "UPDATE sign_in_codes SET attempts = attempts + 1 \
+         WHERE email = $1 AND expires_at > $2 AND attempts < $3 RETURNING code_hash",
+    )
+    .bind(email)
+    .bind(now)
+    .bind(CODE_ATTEMPTS)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(code_hash) = code_hash else {
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT attempts FROM sign_in_codes WHERE email = $1 AND expires_at > $2",
+        )
+        .bind(email)
+        .bind(now)
+        .fetch_optional(&state.db)
+        .await?;
+        return Ok(if live.is_some() {
+            Checked::TooMany
+        } else {
+            Checked::Expired
+        });
+    };
+    let typed: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    if db::hash(&typed) != code_hash {
+        return Ok(Checked::Wrong);
+    }
+    // Only one of two tries with the right code signs in.
+    let used = sqlx::query("DELETE FROM sign_in_codes WHERE email = $1 AND code_hash = $2")
+        .bind(email)
+        .bind(&code_hash)
+        .execute(&state.db)
+        .await?;
+    Ok(if used.rows_affected() == 0 {
+        Checked::Used
+    } else {
+        Checked::Right
+    })
 }
 
 /// The end of every road but the passkey's: the passkey offer after an account's first
@@ -828,7 +929,7 @@ pub async fn skip_passkey(State(state): State<Shared>, headers: HeaderMap) -> Re
         Ok(sign_in) => match sign_in.account_id.clone() {
             Some(account) => finish(&state, &sign_in, &account)
                 .await
-                .map(|()| to_done())
+                .map(|_| to_done())
                 .unwrap_or_else(internal),
             None => pages::email(sign_in.email.as_deref(), None, has_google(&state)),
         },
@@ -844,8 +945,12 @@ fn to_done() -> Response {
 }
 
 /// Ends the sign-in with an authorization code for the app to exchange at
-/// `/token`, which the done page hands it.
-async fn finish(state: &Shared, sign_in: &SignIn, account: &str) -> anyhow::Result<()> {
+/// `/token`, which the done page hands it, and returns that code.
+pub(super) async fn finish(
+    state: &Shared,
+    sign_in: &SignIn,
+    account: &str,
+) -> anyhow::Result<String> {
     let code = db::random_id();
     sqlx::query(
         "INSERT INTO authorization_codes (code_hash, client_id, redirect_uri, nonce, code_challenge, scope, account_id, expires_at) \
@@ -871,7 +976,7 @@ async fn finish(state: &Shared, sign_in: &SignIn, account: &str) -> anyhow::Resu
         .bind(&sign_in.id)
         .execute(&state.db)
         .await?;
-    Ok(())
+    Ok(code)
 }
 
 /// The done page, once: it ends the sign-in and takes the tab back to the app.
