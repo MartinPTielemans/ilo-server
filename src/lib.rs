@@ -45,6 +45,8 @@ pub struct AppState {
     pub commits: sync::CommitRate,
     webauthn: Webauthn,
     signer: jwt::Signer,
+    /// For Google's token endpoint.
+    http: reqwest::Client,
 }
 
 pub type Shared = Arc<AppState>;
@@ -60,6 +62,11 @@ pub async fn state(config: Config, mailer: Mailer, domains: Domains) -> anyhow::
         .rp_name("ilo")
         .build()?;
     let signer = jwt::Signer::load_or_create(&db).await?;
+    let http = reqwest::Client::builder()
+        // A sign-in waits on Google's answer.
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("can't make an HTTPS client")?;
     Ok(Arc::new(AppState {
         config,
         db,
@@ -69,6 +76,7 @@ pub async fn state(config: Config, mailer: Mailer, domains: Domains) -> anyhow::
         commits: sync::CommitRate::default(),
         webauthn,
         signer,
+        http,
     }))
 }
 
@@ -83,6 +91,8 @@ pub fn router(state: Shared) -> Router {
         .route("/authorize/code", post(sign_in::code))
         .route("/authorize/continue", post(sign_in::skip_passkey))
         .route("/authorize/done", get(sign_in::done))
+        .route("/authorize/google", get(sign_in::google_answer))
+        .route("/authorize/google/start", get(sign_in::google_start))
         .route("/authorize/passkey/register", post(sign_in::register_start))
         .route(
             "/authorize/passkey/register/finish",
@@ -101,6 +111,11 @@ pub fn router(state: Shared) -> Router {
         .route("/revoke", post(oidc::revoke))
         .route("/api/devices", get(devices::list))
         .route("/api/devices/{id}", delete(devices::remove))
+        .route("/api/identities", get(devices::identities))
+        .route(
+            "/api/identities/{provider}",
+            delete(devices::remove_identity),
+        )
         .route("/api/account", delete(devices::delete_account))
         .route(
             "/command/",

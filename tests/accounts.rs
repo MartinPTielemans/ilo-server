@@ -2,6 +2,7 @@ mod common;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::google::{from_google, google_tokens, to_google};
 use common::*;
 use serde_json::Value;
 
@@ -939,4 +940,469 @@ async fn a_restarted_server_keeps_its_signing_key() {
     }
     assert_eq!(keys[0].len(), 1);
     assert_eq!(keys[0], keys[1]);
+}
+
+async fn linked_account(server: &Server, person: &google::Person) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT account_id FROM identities WHERE provider = 'google' AND subject = $1",
+    )
+    .bind(&person.sub)
+    .fetch_optional(&server.db)
+    .await
+    .unwrap()
+}
+
+async fn account_of(server: &Server, email: &str) -> Option<String> {
+    ilo_server::accounts::find_by_email(&server.db, email)
+        .await
+        .unwrap()
+}
+
+/// Codes mailed to `email`, leaving out the new-device notices `/token` mails.
+fn codes_to(server: &Server, email: &str) -> usize {
+    let mail = server.mail.lock().unwrap();
+    mail.iter()
+        .filter(|mail| mail.to == email && mail.subject.ends_with("is your ilo sign-in code"))
+        .count()
+}
+
+/// A Gmail address no other test uses: Google holds its mailbox.
+fn gmail(name: &str) -> String {
+    unique_email(name).replace("@example.org", "@gmail.com")
+}
+
+async fn subject(server: &Server, tokens: &Value) -> String {
+    verified_claims(server, tokens["id_token"].as_str().unwrap()).await["sub"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn google_signs_up_a_new_address_and_signs_in_to_it_after() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let person = google::Person::new(&gmail("google-new"));
+
+    let tokens = google_tokens(&server, &google, &person).await;
+    let claims = verified_claims(&server, tokens["id_token"].as_str().unwrap()).await;
+    assert_eq!(claims["email"], person.email);
+    assert_eq!(claims["nonce"], "nonce-1");
+    let account = claims["sub"].as_str().unwrap().to_owned();
+    assert_eq!(
+        linked_account(&server, &person).await,
+        Some(account.clone())
+    );
+    assert_eq!(codes_to(&server, &person.email), 0, "no code is mailed");
+
+    // The second time goes straight to the done page: the passkey was offered once.
+    let browser = browser();
+    let at_google = to_google(&server, &browser, &pkce()).await;
+    let answer = from_google(&browser, google.sign_in(&at_google, &person)).await;
+    server.done(&browser, answer).await;
+
+    // Deleting the account removes the link with it.
+    let deleted = reqwest::Client::new()
+        .delete(format!("{}/api/account", server.url))
+        .bearer_auth(tokens["access_token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+    assert_eq!(linked_account(&server, &person).await, None);
+}
+
+#[tokio::test]
+async fn google_links_at_once_to_an_address_whose_mailbox_it_holds() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let gmail = google::Person::new(&gmail("gmail"));
+    let mut workspace = google::Person::new(&unique_email("workspace"));
+    workspace.hd = Some("example.org".into());
+    for person in [gmail, workspace] {
+        server.device(&person.email, "Mac").await;
+        let account = account_of(&server, &person.email).await.unwrap();
+        let mailed = codes_to(&server, &person.email);
+
+        let tokens = google_tokens(&server, &google, &person).await;
+        assert_eq!(subject(&server, &tokens).await, account, "{}", person.email);
+        assert_eq!(linked_account(&server, &person).await, Some(account));
+        assert_eq!(
+            codes_to(&server, &person.email),
+            mailed,
+            "no code is mailed: {}",
+            person.email
+        );
+    }
+}
+
+#[tokio::test]
+async fn google_asks_for_the_mailed_code_before_linking_an_address_it_doesnt_hold() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let mut pages = Vec::new();
+    for has_account in [true, false] {
+        let mut person = google::Person::new(&unique_email("linking"));
+        // A Workspace account, but on another domain than the address's.
+        person.hd = Some("other.example.org".into());
+        let account = if has_account {
+            server.device(&person.email, "Mac").await;
+            account_of(&server, &person.email).await
+        } else {
+            None
+        };
+
+        let browser = browser();
+        let pkce = pkce();
+        let at_google = to_google(&server, &browser, &pkce).await;
+        let page = from_google(&browser, google.sign_in(&at_google, &person))
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(page.contains("To use Google sign-in"), "{page}");
+        pages.push(page.replace(&person.email, "ADDRESS"));
+        assert_eq!(
+            linked_account(&server, &person).await,
+            None,
+            "not before the code"
+        );
+        assert_eq!(account_of(&server, &person.email).await, account);
+
+        let mut finished = browser
+            .post(format!("{}/authorize/code", server.url))
+            .form(&[("code", server.last_code(&person.email))])
+            .send()
+            .await
+            .unwrap();
+        if !has_account {
+            assert!(finished.text().await.unwrap().contains("Add a passkey"));
+            finished = browser
+                .post(format!("{}/authorize/continue", server.url))
+                .send()
+                .await
+                .unwrap();
+        }
+        let code = server.done(&browser, finished).await;
+        let tokens: Value = server
+            .exchange(&code, &pkce.verifier, "Mac")
+            .await
+            .json()
+            .await
+            .unwrap();
+        let account = subject(&server, &tokens).await;
+        assert_eq!(
+            account_of(&server, &person.email).await.as_ref(),
+            Some(&account)
+        );
+        assert_eq!(
+            linked_account(&server, &person).await.as_ref(),
+            Some(&account)
+        );
+
+        // From then on, Google signs in to it with no code.
+        let mailed = codes_to(&server, &person.email);
+        let tokens = google_tokens(&server, &google, &person).await;
+        assert_eq!(subject(&server, &tokens).await, account);
+        assert_eq!(codes_to(&server, &person.email), mailed);
+    }
+    assert_eq!(
+        pages[0], pages[1],
+        "the page doesn't say which addresses have accounts"
+    );
+}
+
+#[tokio::test]
+async fn a_code_for_another_address_links_no_waiting_google_account() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let person = google::Person::new(&unique_email("waiting"));
+    server.device(&person.email, "Mac").await;
+
+    let browser = browser();
+    let at_google = to_google(&server, &browser, &pkce()).await;
+    from_google(&browser, google.sign_in(&at_google, &person)).await;
+    // The user goes back and signs in to another address of theirs with its code instead.
+    let other = unique_email("other");
+    browser
+        .post(format!("{}/authorize/email", server.url))
+        .form(&[("email", &other)])
+        .send()
+        .await
+        .unwrap();
+    let finished = browser
+        .post(format!("{}/authorize/code", server.url))
+        .form(&[("code", server.last_code(&other))])
+        .send()
+        .await
+        .unwrap();
+    assert!(finished.text().await.unwrap().contains("Add a passkey"));
+    assert_eq!(linked_account(&server, &person).await, None);
+}
+
+#[tokio::test]
+async fn a_google_account_whose_address_changed_still_finds_its_account() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let mut person = google::Person::new(&gmail("before"));
+    let first = subject(&server, &google_tokens(&server, &google, &person).await).await;
+
+    let before = person.email.clone();
+    person.email = gmail("after");
+    let browser = browser();
+    let at_google = to_google(&server, &browser, &pkce()).await;
+    let answer = from_google(&browser, google.sign_in(&at_google, &person)).await;
+    assert_eq!(answer.status(), 303);
+    let page = browser
+        .get(format!("{}/authorize/done", server.url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(&before), "the account's own address: {page}");
+    assert_eq!(linked_account(&server, &person).await, Some(first));
+    assert_eq!(
+        account_of(&server, &person.email).await,
+        None,
+        "no second account"
+    );
+}
+
+#[tokio::test]
+async fn a_google_sign_in_that_fails_links_nothing() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let refused = async |person: &google::Person, back: &dyn Fn(&url::Url) -> url::Url| {
+        let browser = browser();
+        let at_google = to_google(&server, &browser, &pkce()).await;
+        let page = from_google(&browser, back(&at_google)).await;
+        assert_eq!(page.status(), 200);
+        let page = page.text().await.unwrap();
+        assert!(
+            page.contains("Sign in to ilo"),
+            "back to the first page: {page}"
+        );
+        assert_eq!(linked_account(&server, person).await, None);
+        assert_eq!(account_of(&server, &person.email).await, None);
+        page
+    };
+
+    let person = google::Person::new(&unique_email("forged"));
+    let page = refused(&person, &|at_google| {
+        let mut back = google.sign_in(at_google, &person);
+        let pairs: Vec<(String, String)> = back.query_pairs().into_owned().collect();
+        back.query_pairs_mut().clear();
+        for (name, value) in pairs {
+            let value = if name == "state" {
+                "forged".into()
+            } else {
+                value
+            };
+            back.query_pairs_mut().append_pair(&name, &value);
+        }
+        back
+    })
+    .await;
+    assert!(page.contains("didn&#39;t finish"), "{page}");
+
+    let mut unverified = google::Person::new(&unique_email("unverified"));
+    unverified.verified = false;
+    let page = refused(&unverified, &|at_google| {
+        google.sign_in(at_google, &unverified)
+    })
+    .await;
+    assert!(page.contains("hasn&#39;t verified"), "{page}");
+
+    let person = google::Person::new(&unique_email("refused"));
+    let page = refused(&person, &|at_google| google.refuse(at_google)).await;
+    assert!(page.contains("was cancelled"), "{page}");
+}
+
+#[tokio::test]
+async fn google_answers_a_trip_once() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let person = google::Person::new(&unique_email("replay"));
+    let browser = browser();
+    let at_google = to_google(&server, &browser, &pkce()).await;
+    let refusal = google.refuse(&at_google);
+    let page = from_google(&browser, refusal).await.text().await.unwrap();
+    assert!(page.contains("was cancelled"));
+    // The trip's state is spent, so a code for it afterwards is refused.
+    let page = from_google(&browser, google.sign_in(&at_google, &person))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("didn&#39;t finish"), "{page}");
+    assert_eq!(linked_account(&server, &person).await, None);
+}
+
+#[tokio::test]
+async fn a_server_says_whether_it_has_a_google_road() {
+    async fn discovery(server: &Server) -> Value {
+        reqwest::get(format!("{}/.well-known/openid-configuration", server.url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    let button = r#"href="/authorize/google/start""#;
+    // A server that offers no Google road: no ilo_google, provider ignored, and no button.
+    async fn no_road(server: &Server, button: &str, why: &str) {
+        assert_eq!(discovery(server).await.get("ilo_google"), None, "{why}");
+        let browser = browser();
+        let page = browser
+            .get(server.authorize_url(&pkce(), "s") + "&provider=google")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 200, "{why}: provider is ignored");
+        let page = page.text().await.unwrap();
+        assert!(
+            page.contains("Sign in to ilo") && !page.contains("Google"),
+            "{why}: {page}"
+        );
+        let page = browser
+            .get(format!("{}/authorize/google/start", server.url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!page.contains(button), "{why}: {page}");
+    }
+
+    no_road(&start().await, button, "no Google client").await;
+    let google = google::Google::start().await;
+    let unoffered = start_with_vars(&google.client_vars()).await;
+    no_road(&unoffered, button, "a Google client not offered yet").await;
+
+    let server = start_with_google(&google).await;
+    assert_eq!(discovery(&server).await["ilo_google"], true);
+    let browser = common::browser();
+    let page = browser
+        .get(server.authorize_url(&pkce(), "s"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains(button) && page.contains("Continue with Google"),
+        "{page}"
+    );
+    // The page's button goes on to Google with the same sign-in.
+    let start = browser
+        .get(format!("{}/authorize/google/start", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 303);
+    let at_google = url::Url::parse(start.headers()["location"].to_str().unwrap()).unwrap();
+    let person = google::Person::new(&gmail("button"));
+    let answer = from_google(&browser, google.sign_in(&at_google, &person)).await;
+    assert!(answer.text().await.unwrap().contains("Add a passkey"));
+}
+
+async fn listed_identities(server: &Server, token: &str) -> Value {
+    let listed = reqwest::Client::new()
+        .get(format!("{}/api/identities", server.url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    listed.json().await.unwrap()
+}
+
+async fn remove_google(server: &Server, token: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .delete(format!("{}/api/identities/google", server.url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn a_linked_google_sign_in_is_listed_and_removed_and_then_needs_the_mailed_code() {
+    let google = google::Google::start().await;
+    let server = start_with_google(&google).await;
+    let person = google::Person::new(&gmail("removed"));
+    let tokens = google_tokens(&server, &google, &person).await;
+    let token = tokens["access_token"].as_str().unwrap();
+    let account = subject(&server, &tokens).await;
+
+    let listed = listed_identities(&server, token).await;
+    let identities = listed["identities"].as_array().unwrap();
+    assert_eq!(identities.len(), 1, "{listed}");
+    assert_eq!(identities[0]["provider"], "google");
+    assert_eq!(identities[0]["email"], person.email);
+    assert!(identities[0]["linked_at"].as_i64().unwrap() > 0);
+    assert!(
+        !listed.to_string().contains(&person.sub),
+        "Google's id isn't shown"
+    );
+
+    assert_eq!(remove_google(&server, token).await, 204);
+    assert_eq!(
+        listed_identities(&server, token).await["identities"],
+        serde_json::json!([])
+    );
+    assert_eq!(linked_account(&server, &person).await, None);
+    assert_eq!(
+        remove_google(&server, token).await,
+        404,
+        "nothing left to remove"
+    );
+
+    // Google alone no longer signs in, even with the Gmail address Google holds.
+    let browser = browser();
+    let pkce = pkce();
+    let at_google = to_google(&server, &browser, &pkce).await;
+    let page = from_google(&browser, google.sign_in(&at_google, &person)).await;
+    assert_eq!(page.status(), 200);
+    assert!(page.text().await.unwrap().contains("To use Google sign-in"));
+    assert_eq!(linked_account(&server, &person).await, None);
+
+    // The mailed code still signs in, from another tab.
+    let device = server.device(&person.email, "Phone").await;
+    let userinfo: Value = reqwest::Client::new()
+        .get(format!("{}/userinfo", server.url))
+        .bearer_auth(&device.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(userinfo["sub"], account.as_str());
+
+    // And in the Google tab, entering the code links Google again: the user's own choice.
+    sqlx::query("UPDATE sign_in_codes SET sent_at = sent_at - 60 WHERE email = $1")
+        .bind(&person.email)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let page = browser
+        .post(format!("{}/authorize/send-code", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert!(page.text().await.unwrap().contains("We sent a new code."));
+    let finished = browser
+        .post(format!("{}/authorize/code", server.url))
+        .form(&[("code", server.last_code(&person.email))])
+        .send()
+        .await
+        .unwrap();
+    server.done(&browser, finished).await;
+    assert_eq!(linked_account(&server, &person).await, Some(account));
 }

@@ -28,6 +28,55 @@ pub struct Config {
     pub sync_limits: crate::sync::Limits,
     /// `COUNTS_PASSWORD`, which `GET /counts` asks for as user `ilo`. Without it there's no page.
     pub counts_password: Option<Password>,
+    /// `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, the server's own client at Google, for
+    /// signing in with Google. Without them there's no Google road.
+    pub google: Option<Google>,
+    /// `GOOGLE_OFFERED`: the pages, discovery and `provider=google` offer the Google road. Off
+    /// by default, so a client Google still has in testing, which only its listed test users can
+    /// finish, is offered to no one. Off, a trip already at Google still comes back.
+    pub google_offered: bool,
+}
+
+/// Google as the sign-in pages' other provider, with the server as its client.
+#[derive(Clone, Debug)]
+pub struct Google {
+    pub client_id: String,
+    pub client_secret: Password,
+    /// Who signs Google's ID tokens, which the token's `iss` names.
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+impl Google {
+    const ISSUER: &str = "https://accounts.google.com";
+
+    /// Google's own endpoints, or with `GOOGLE_TEST_URL` a stand-in's: `/auth` and `/token`
+    /// there, with that URL as the issuer.
+    fn new(client_id: String, client_secret: String, test_url: Option<&str>) -> Self {
+        let (issuer, authorization_endpoint, token_endpoint) = match test_url {
+            Some(url) => {
+                let url = url.trim_end_matches('/');
+                (
+                    url.to_owned(),
+                    format!("{url}/auth"),
+                    format!("{url}/token"),
+                )
+            }
+            None => (
+                Self::ISSUER.to_owned(),
+                "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+                "https://oauth2.googleapis.com/token".to_owned(),
+            ),
+        };
+        Self {
+            client_id,
+            client_secret: Password(client_secret),
+            issuer,
+            authorization_endpoint,
+            token_endpoint,
+        }
+    }
 }
 
 /// A password from the environment, which `Debug` never prints.
@@ -143,6 +192,23 @@ impl Config {
                 None => Ok(default),
             }
         };
+        let test_url = var("GOOGLE_TEST_URL");
+        if test_url.is_some() && !dev_mode {
+            bail!("GOOGLE_TEST_URL is for tests, and is honoured only in DEV_MODE");
+        }
+        let google = match (var("GOOGLE_CLIENT_ID"), var("GOOGLE_CLIENT_SECRET")) {
+            (Some(id), Some(secret)) => Some(Google::new(id, secret, test_url.as_deref())),
+            (None, None) => None,
+            _ => bail!("set both GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET, or neither"),
+        };
+        let google_offered = match var("GOOGLE_OFFERED").as_deref() {
+            None | Some("0" | "false") => false,
+            Some("1" | "true") => true,
+            Some(_) => bail!("GOOGLE_OFFERED is 1 or true to offer Google, else 0 or false"),
+        };
+        if google_offered && google.is_none() {
+            bail!("GOOGLE_OFFERED needs GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET");
+        }
         Ok(Self {
             host: var("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port,
@@ -167,7 +233,14 @@ impl Config {
                 commits_per_minute: count("SYNC_COMMITS_PER_MINUTE", 120)?,
             },
             counts_password: var("COUNTS_PASSWORD").map(Password),
+            google,
+            google_offered,
         })
+    }
+
+    /// The Google client, while the server offers its road.
+    pub fn offered_google(&self) -> Option<&Google> {
+        self.google.as_ref().filter(|_| self.google_offered)
     }
 
     /// The issuer, without a trailing slash, as OIDC compares it byte for byte.
@@ -246,6 +319,64 @@ mod tests {
         assert!(!format!("{set:?}").contains("secret-word"));
         let unset = config(&[("DEV_MODE", "1")]).unwrap();
         assert!(unset.counts_password.is_none());
+    }
+
+    #[test]
+    fn google_needs_its_id_and_secret_together_and_never_prints_the_secret() {
+        let set = production(&[
+            ("SMTP_URL", "smtps://mail.example.org"),
+            ("GOOGLE_CLIENT_ID", "client.apps.googleusercontent.com"),
+            ("GOOGLE_CLIENT_SECRET", "secret-word"),
+        ])
+        .unwrap();
+        let google = set.google.as_ref().unwrap();
+        assert_eq!(google.client_id, "client.apps.googleusercontent.com");
+        assert_eq!(google.client_secret.0, "secret-word");
+        assert_eq!(google.issuer, "https://accounts.google.com");
+        assert!(!format!("{set:?}").contains("secret-word"));
+        assert!(config(&[("DEV_MODE", "1")]).unwrap().google.is_none());
+        for one in ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"] {
+            let error = config(&[("DEV_MODE", "1"), (one, "x")]).unwrap_err();
+            assert!(error.to_string().contains("neither"), "{one}");
+        }
+    }
+
+    #[test]
+    fn a_stand_in_google_is_for_dev_mode_only() {
+        let google = [
+            ("GOOGLE_CLIENT_ID", "id"),
+            ("GOOGLE_CLIENT_SECRET", "secret"),
+            ("GOOGLE_TEST_URL", "http://127.0.0.1:9000/"),
+        ];
+        let dev = config(&[&google[..], &[("DEV_MODE", "1")]].concat()).unwrap();
+        let google_config = dev.google.unwrap();
+        assert_eq!(google_config.issuer, "http://127.0.0.1:9000");
+        assert_eq!(google_config.token_endpoint, "http://127.0.0.1:9000/token");
+        let error = production(&[&google[..], &[("SMTP_URL", "smtps://m.example.org")]].concat())
+            .unwrap_err();
+        assert!(error.to_string().contains("GOOGLE_TEST_URL"));
+    }
+
+    #[test]
+    fn google_is_offered_only_when_the_server_says_so() {
+        let google = [
+            ("DEV_MODE", "1"),
+            ("GOOGLE_CLIENT_ID", "id"),
+            ("GOOGLE_CLIENT_SECRET", "secret"),
+        ];
+        let set = config(&google).unwrap();
+        assert!(
+            set.google.is_some() && set.offered_google().is_none(),
+            "off by default"
+        );
+        for (value, offered) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let set = config(&[&google[..], &[("GOOGLE_OFFERED", value)]].concat()).unwrap();
+            assert_eq!(set.offered_google().is_some(), offered, "{value}");
+        }
+        let error = config(&[&google[..], &[("GOOGLE_OFFERED", "yes")]].concat()).unwrap_err();
+        assert!(error.to_string().contains("GOOGLE_OFFERED"));
+        let error = config(&[("DEV_MODE", "1"), ("GOOGLE_OFFERED", "1")]).unwrap_err();
+        assert!(error.to_string().contains("GOOGLE_CLIENT_ID"));
     }
 
     #[test]

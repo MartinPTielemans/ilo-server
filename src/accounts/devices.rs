@@ -1,4 +1,4 @@
-//! The account's devices, and deleting the account, for ilo's Settings.
+//! The account's devices, its linked sign-ins, and deleting the account, for ilo's Settings.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -70,6 +70,68 @@ pub async fn remove(
             state.relay.disconnect_device(&device.account_id, &id);
             StatusCode::NO_CONTENT.into_response()
         }
+        Err(error) => internal(error),
+    }
+}
+
+/// The account's other ways to sign in besides its mailed code, which always works: its linked
+/// Google account. Each is named by its provider and the address it was linked with, which is
+/// the account's, since a Google account links only to its own address. The server keeps
+/// nothing else of it to show.
+pub async fn identities(
+    State(state): State<Shared>,
+    Authenticated(device): Authenticated,
+) -> Response {
+    let listed: anyhow::Result<_> = async {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT provider, MIN(created_at) FROM identities WHERE account_id = $1 \
+             GROUP BY provider ORDER BY MIN(created_at), provider",
+        )
+        .bind(&device.account_id)
+        .fetch_all(&state.db)
+        .await?;
+        let email = super::email(&state.db, &device.account_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(provider, linked_at)| {
+                json!({ "provider": provider, "email": email, "linked_at": linked_at })
+            })
+            .collect::<Vec<_>>())
+    }
+    .await;
+    match listed {
+        Ok(identities) => Json(json!({ "identities": identities })).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+/// Removes the account's sign-in through `provider`. Google then links to the account again only
+/// with the address's mailed code, so a Gmail address doesn't link itself back at the next
+/// Google sign-in.
+pub async fn remove_identity(
+    State(state): State<Shared>,
+    Authenticated(device): Authenticated,
+    Path(provider): Path<String>,
+) -> Response {
+    let removed: anyhow::Result<u64> = async {
+        // Marked before the link goes, so no moment lets Google link back without the code.
+        if provider == super::google::PROVIDER {
+            sqlx::query("UPDATE accounts SET google_removed = 1 WHERE id = $1")
+                .bind(&device.account_id)
+                .execute(&state.db)
+                .await?;
+        }
+        let removed = sqlx::query("DELETE FROM identities WHERE account_id = $1 AND provider = $2")
+            .bind(&device.account_id)
+            .bind(&provider)
+            .execute(&state.db)
+            .await?;
+        Ok(removed.rows_affected())
+    }
+    .await;
+    match removed {
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal(error),
     }
 }
