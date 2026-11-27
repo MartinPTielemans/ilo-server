@@ -94,6 +94,16 @@ pub fn email(hint: Option<&str>, error: Option<&str>, google: bool) -> Response 
     )
 }
 
+/// The first page's passkey step alone, for an app that draws the address and the code itself.
+pub fn passkey() -> Response {
+    page(
+        "Sign in to ilo",
+        "",
+        r#"<p class="error" id="passkey-error" role="alert" hidden></p>
+<form><button type="button" data-passkey="login" autofocus>Use a passkey</button></form>"#,
+    )
+}
+
 pub struct Code<'a> {
     pub email: &'a str,
     /// Until the code expires, rounded up: 0 once it has.

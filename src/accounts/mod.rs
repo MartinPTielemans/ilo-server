@@ -3,6 +3,7 @@
 
 pub mod devices;
 pub mod google;
+pub mod native;
 pub mod oidc;
 mod pages;
 pub use pages::{script as pages_script, style as pages_style};
